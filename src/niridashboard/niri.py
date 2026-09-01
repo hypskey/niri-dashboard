@@ -23,3 +23,17 @@ def get_workspaces():
 
 def get_outputs():
     return run_niri_json("outputs")
+
+
+def focus_window(window_id):
+    subprocess.run(
+        [
+            "niri",
+            "msg",
+            "action",
+            "focus-window",
+            "--id",
+            str(window_id),
+        ],
+        check=True,
+    )
