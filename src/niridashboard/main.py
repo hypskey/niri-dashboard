@@ -4,6 +4,7 @@ from PySide6.QtCore import QTimer, Qt
 from PySide6.QtGui import QBrush, QPen
 from PySide6.QtWidgets import (
     QApplication,
+    QGraphicsItem,
     QGraphicsRectItem,
     QGraphicsScene,
     QGraphicsTextItem,
@@ -16,20 +17,120 @@ from niri import (
     get_outputs,
     get_windows,
     get_workspaces,
+    move_window_to_workspace,
 )
 
-class WindowCard(QGraphicsRectItem):
-    def __init__(self, window_id, width, height, pen):
-        super().__init__(0, 0, width, height)
 
-        self.window_id = window_id
+class WorkspaceDropZone(QGraphicsRectItem):
+    def __init__(
+        self,
+        workspace_id,
+        x,
+        y,
+        width,
+        height,
+        pen,
+    ):
+        super().__init__(x, y, width, height)
+
+        self.workspace_id = workspace_id
+        self.normal_pen = pen
         self.setPen(pen)
 
+    def set_drop_active(self, active):
+        if active:
+            self.setPen(QPen(Qt.GlobalColor.cyan, 4))
+        else:
+            self.setPen(self.normal_pen)
+
+
+class WindowCard(QGraphicsRectItem):
+    def __init__(
+        self,
+        window,
+        workspace_id,
+        width,
+        height,
+        pen,
+    ):
+        super().__init__(0, 0, width, height)
+
+        self.window_id = window["id"]
+        self.workspace_id = workspace_id
+        self.drag_start_position = None
+        self.active_drop_zone = None
+
+        self.setPen(pen)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setFlag(
+            QGraphicsItem.GraphicsItemFlag.ItemIsMovable,
+            True,
+        )
+
+        app_text = QGraphicsTextItem(window["app_id"], self)
+        app_text.setDefaultTextColor(Qt.GlobalColor.white)
+        app_text.setPos(8, 0)
+        app_text.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+
+        title = window["title"]
+
+        if len(title) > 45:
+            title = title[:42] + "..."
+
+        title_text = QGraphicsTextItem(title, self)
+        title_text.setDefaultTextColor(Qt.GlobalColor.lightGray)
+        title_text.setPos(8, 22)
+        title_text.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
 
     def mousePressEvent(self, event):
-        focus_window(self.window_id)
+        self.drag_start_position = self.pos()
         super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        super().mouseMoveEvent(event)
+        self.set_active_drop_zone(
+            self.drop_zone_at(event.scenePos())
+        )
+
+    def mouseReleaseEvent(self, event):
+        drop_zone = self.drop_zone_at(event.scenePos())
+        moved = self.pos() != self.drag_start_position
+
+        super().mouseReleaseEvent(event)
+        self.set_active_drop_zone(None)
+        self.setPos(self.drag_start_position)
+
+        if moved:
+            if (
+                drop_zone is not None
+                and drop_zone.workspace_id != self.workspace_id
+            ):
+                move_window_to_workspace(
+                    self.window_id,
+                    drop_zone.workspace_id,
+                )
+        else:
+            focus_window(self.window_id)
+
+    def drop_zone_at(self, scene_position):
+        for item in self.scene().items(scene_position):
+            if isinstance(item, WorkspaceDropZone):
+                return item
+
+        return None
+
+    def set_active_drop_zone(self, drop_zone):
+        if drop_zone is self.active_drop_zone:
+            return
+
+        if self.active_drop_zone is not None:
+            self.active_drop_zone.set_drop_active(False)
+
+        self.active_drop_zone = drop_zone
+
+        if self.active_drop_zone is not None:
+            self.active_drop_zone.set_drop_active(True)
+
 
 class Dashboard(QMainWindow):
     def __init__(self):
@@ -103,7 +204,7 @@ class Dashboard(QMainWindow):
             height = logical["height"] * scale
 
             # Monitor body.
-            monitor = self.scene.addRect(
+            self.scene.addRect(
                 x,
                 y,
                 width,
@@ -161,13 +262,16 @@ class Dashboard(QMainWindow):
                         1,
                     )
 
-                self.scene.addRect(
+                workspace_zone = WorkspaceDropZone(
+                    workspace["id"],
                     x + 8,
                     workspace_y,
                     width - 16,
                     workspace_height - 5,
                     workspace_pen,
                 )
+
+                self.scene.addItem(workspace_zone)
 
                 workspace_name = workspace["name"]
 
@@ -211,6 +315,7 @@ class Dashboard(QMainWindow):
                 for window in workspace_windows:
                     self.draw_window_card(
                         window,
+                        workspace["id"],
                         x + 18,
                         window_y,
                         width - 36,
@@ -232,7 +337,14 @@ class Dashboard(QMainWindow):
             Qt.AspectRatioMode.KeepAspectRatio,
         )
 
-    def draw_window_card(self, window, x, y, width):
+    def draw_window_card(
+        self,
+        window,
+        workspace_id,
+        x,
+        y,
+        width,
+    ):
         card_height = 52
 
         if window["is_focused"]:
@@ -241,60 +353,16 @@ class Dashboard(QMainWindow):
             pen = QPen(Qt.GlobalColor.gray, 1)
 
         card = WindowCard(
-            window["id"],
+            window,
+            workspace_id,
             width,
             card_height,
             pen,
         )
 
-
         card.setPos(x, y)
         card.setZValue(5)
         self.scene.addItem(card)
-
-
-        app_text = self.scene.addText(
-            window["app_id"]
-        )
-
-        app_text.setDefaultTextColor(
-            Qt.GlobalColor.white
-        )
-
-        app_text.setPos(
-            x + 8,
-            y
-        )
-
-        app_text.setZValue(10)
-
-        app_text.setAcceptedMouseButtons(
-            Qt.MouseButton.NoButton
-        )
-
-        title = window["title"]
-
-        if len(title) > 45:
-            title = title[:42] + "..."
-
-        title_text = self.scene.addText(
-            title
-        )
-
-        title_text.setDefaultTextColor(
-            Qt.GlobalColor.lightGray
-        )
-
-        title_text.setPos(
-            x + 8,
-            y + 22
-        )
-
-        title_text.setZValue(10)
-
-        title_text.setAcceptedMouseButtons(
-            Qt.MouseButton.NoButton
-        )
 
 
 app = QApplication(sys.argv)
