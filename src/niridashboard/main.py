@@ -1,18 +1,15 @@
 import sys
 
-from PySide6.QtCore import QTimer
+from PySide6.QtCore import QTimer, Qt
+from PySide6.QtGui import QBrush, QPen
 from PySide6.QtWidgets import (
     QApplication,
-    QFrame,
-    QHBoxLayout,
-    QLabel,
+    QGraphicsScene,
+    QGraphicsView,
     QMainWindow,
-    QScrollArea,
-    QVBoxLayout,
-    QWidget,
 )
 
-from niri import get_windows
+from niri import get_outputs, get_windows, get_workspaces
 
 
 class Dashboard(QMainWindow):
@@ -20,147 +17,211 @@ class Dashboard(QMainWindow):
         super().__init__()
 
         self.setWindowTitle("NiriDashBoard")
-        self.resize(1200, 700)
+        self.resize(1400, 800)
+
+        self.scene = QGraphicsScene()
+
+        self.view = QGraphicsView(self.scene)
+        self.view.setRenderHints(self.view.renderHints())
+        self.setCentralWidget(self.view)
 
         self.last_state = None
 
-        self.container = QWidget()
-        self.main_layout = QVBoxLayout(self.container)
-
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setWidget(self.container)
-
-        self.setCentralWidget(scroll)
-
-        # First draw.
         self.refresh_dashboard()
 
-        # Refresh Niri state twice per second.
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.refresh_dashboard)
         self.timer.start(500)
 
     def refresh_dashboard(self):
         windows = get_windows()
+        workspaces = get_workspaces()
+        outputs = get_outputs()
 
-        # Build a compact representation of the current state.
-        current_state = tuple(
-            sorted(
-                (
-                    window["id"],
-                    window["app_id"],
-                    window["title"],
-                    window["workspace_id"],
-                    window["is_focused"],
-                )
-                for window in windows
-            )
+        current_state = (
+            repr(windows),
+            repr(workspaces),
+            repr(outputs),
         )
 
-        # Don't redraw if nothing changed.
         if current_state == self.last_state:
             return
 
         self.last_state = current_state
 
-        self.clear_layout(self.main_layout)
+        self.draw_dashboard(windows, workspaces, outputs)
 
-        title = QLabel("NiriDashBoard")
-        title.setStyleSheet(
-            "font-size: 28px; font-weight: bold;"
+    def draw_dashboard(self, windows, workspaces, outputs):
+        self.scene.clear()
+
+        # Scale Niri desktop coordinates down to dashboard coordinates.
+        scale = 0.22
+
+        min_x = min(
+            output["logical"]["x"]
+            for output in outputs.values()
+            if output["logical"] is not None
         )
-        self.main_layout.addWidget(title)
 
-        workspaces = {}
+        min_y = min(
+            output["logical"]["y"]
+            for output in outputs.values()
+            if output["logical"] is not None
+        )
 
-        for window in windows:
-            workspace_id = window["workspace_id"]
+        margin = 80
 
-            if workspace_id not in workspaces:
-                workspaces[workspace_id] = []
+        for output_name, output in outputs.items():
+            logical = output["logical"]
 
-            workspaces[workspace_id].append(window)
+            if logical is None:
+                continue
 
-        for workspace_id in sorted(workspaces):
-            workspace_label = QLabel(
-                f"Workspace {workspace_id}"
+            x = (logical["x"] - min_x) * scale + margin
+            y = (logical["y"] - min_y) * scale + margin
+
+            width = logical["width"] * scale
+            height = logical["height"] * scale
+
+            # Monitor body.
+            monitor = self.scene.addRect(
+                x,
+                y,
+                width,
+                height,
+                QPen(Qt.GlobalColor.white, 3),
+                QBrush(Qt.GlobalColor.black),
             )
 
-            workspace_label.setStyleSheet(
-                """
-                font-size: 20px;
-                font-weight: bold;
-                margin-top: 20px;
-                """
+            # Monitor name.
+            title = self.scene.addText(
+                f"{output_name} — {output['model']}"
             )
 
-            self.main_layout.addWidget(workspace_label)
+            title.setDefaultTextColor(Qt.GlobalColor.white)
+            title.setPos(x + 12, y + 8)
 
-            row = QHBoxLayout()
+            # Find workspaces belonging to this monitor.
+            output_workspaces = [
+                workspace
+                for workspace in workspaces
+                if workspace["output"] == output_name
+            ]
 
-            for window in workspaces[workspace_id]:
-                card = self.create_window_card(window)
-                row.addWidget(card)
+            active_workspace = next(
+                (
+                    workspace
+                    for workspace in output_workspaces
+                    if workspace["is_active"]
+                ),
+                None,
+            )
 
-            row.addStretch()
+            if active_workspace is not None:
+                workspace_name = active_workspace["name"]
 
-            self.main_layout.addLayout(row)
+                if workspace_name:
+                    workspace_text = (
+                        f"Workspace {active_workspace['id']} "
+                        f"— {workspace_name}"
+                    )
+                else:
+                    workspace_text = (
+                        f"Workspace {active_workspace['id']}"
+                    )
 
-        self.main_layout.addStretch()
+                workspace_label = self.scene.addText(
+                    workspace_text
+                )
 
-    def create_window_card(self, window):
-        card = QFrame()
-        card.setFixedSize(260, 120)
+                workspace_label.setDefaultTextColor(
+                    Qt.GlobalColor.lightGray
+                )
+
+                workspace_label.setPos(
+                    x + 12,
+                    y + 35,
+                )
+
+                # Only show windows on the currently visible
+                # workspace for this monitor.
+                workspace_windows = [
+                    window
+                    for window in windows
+                    if window["workspace_id"]
+                    == active_workspace["id"]
+                ]
+
+                card_y = y + 75
+
+                for window in workspace_windows:
+                    self.draw_window_card(
+                        window,
+                        x + 15,
+                        card_y,
+                        width - 30,
+                    )
+
+                    card_y += 75
+
+        self.scene.setSceneRect(
+            self.scene.itemsBoundingRect().adjusted(
+                -40,
+                -40,
+                40,
+                40,
+            )
+        )
+
+        self.view.fitInView(
+            self.scene.sceneRect(),
+            Qt.AspectRatioMode.KeepAspectRatio,
+        )
+
+    def draw_window_card(self, window, x, y, width):
+        card_height = 60
 
         if window["is_focused"]:
-            border = "3px solid white"
+            pen = QPen(Qt.GlobalColor.white, 3)
         else:
-            border = "1px solid gray"
+            pen = QPen(Qt.GlobalColor.gray, 1)
 
-        card.setStyleSheet(
-            f"""
-            QFrame {{
-                border: {border};
-                border-radius: 8px;
-                padding: 8px;
-            }}
-            """
+        self.scene.addRect(
+            x,
+            y,
+            width,
+            card_height,
+            pen,
         )
 
-        layout = QVBoxLayout(card)
-
-        app = QLabel(window["app_id"])
-        app.setStyleSheet(
-            "font-size: 16px; font-weight: bold;"
+        app_text = self.scene.addText(
+            window["app_id"]
         )
 
-        title = QLabel(window["title"])
-        title.setWordWrap(True)
-
-        window_id = QLabel(
-            f"Window ID: {window['id']}"
+        app_text.setDefaultTextColor(
+            Qt.GlobalColor.white
         )
 
-        layout.addWidget(app)
-        layout.addWidget(title)
-        layout.addWidget(window_id)
+        app_text.setPos(
+            x + 8,
+            y + 4,
+        )
 
-        return card
+        title = window["title"]
 
-    def clear_layout(self, layout):
-        while layout.count():
-            item = layout.takeAt(0)
+        if len(title) > 45:
+            title = title[:42] + "..."
 
-            widget = item.widget()
+        title_text = self.scene.addText(title)
 
-            if widget is not None:
-                widget.deleteLater()
+        title_text.setDefaultTextColor(
+            Qt.GlobalColor.lightGray
+        )
 
-            child_layout = item.layout()
-
-            if child_layout is not None:
-                self.clear_layout(child_layout)
+        title_text.setPos(
+            x + 8,
+            y + 28,
+        )
 
 
 app = QApplication(sys.argv)
