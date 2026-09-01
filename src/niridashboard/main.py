@@ -4,13 +4,32 @@ from PySide6.QtCore import QTimer, Qt
 from PySide6.QtGui import QBrush, QPen
 from PySide6.QtWidgets import (
     QApplication,
+    QGraphicsRectItem,
     QGraphicsScene,
+    QGraphicsTextItem,
     QGraphicsView,
     QMainWindow,
 )
 
-from niri import get_outputs, get_windows, get_workspaces
+from niri import (
+    focus_window,
+    get_outputs,
+    get_windows,
+    get_workspaces,
+)
 
+class WindowCard(QGraphicsRectItem):
+    def __init__(self, window_id, width, height, pen):
+        super().__init__(0, 0, width, height)
+
+        self.window_id = window_id
+        self.setPen(pen)
+
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+
+    def mousePressEvent(self, event):
+        focus_window(self.window_id)
+        super().mousePressEvent(event)
 
 class Dashboard(QMainWindow):
     def __init__(self):
@@ -221,13 +240,18 @@ class Dashboard(QMainWindow):
         else:
             pen = QPen(Qt.GlobalColor.gray, 1)
 
-        self.scene.addRect(
-            x,
-            y,
+        card = WindowCard(
+            window["id"],
             width,
             card_height,
             pen,
         )
+
+
+        card.setPos(x, y)
+        card.setZValue(5)
+        self.scene.addItem(card)
+
 
         app_text = self.scene.addText(
             window["app_id"]
@@ -239,7 +263,13 @@ class Dashboard(QMainWindow):
 
         app_text.setPos(
             x + 8,
-            y + 4,
+            y
+        )
+
+        app_text.setZValue(10)
+
+        app_text.setAcceptedMouseButtons(
+            Qt.MouseButton.NoButton
         )
 
         title = window["title"]
@@ -247,7 +277,9 @@ class Dashboard(QMainWindow):
         if len(title) > 45:
             title = title[:42] + "..."
 
-        title_text = self.scene.addText(title)
+        title_text = self.scene.addText(
+            title
+        )
 
         title_text.setDefaultTextColor(
             Qt.GlobalColor.lightGray
@@ -255,7 +287,13 @@ class Dashboard(QMainWindow):
 
         title_text.setPos(
             x + 8,
-            y + 24,
+            y + 22
+        )
+
+        title_text.setZValue(10)
+
+        title_text.setAcceptedMouseButtons(
+            Qt.MouseButton.NoButton
         )
 
 
