@@ -108,61 +108,96 @@ class Dashboard(QMainWindow):
                 if workspace["output"] == output_name
             ]
 
-            active_workspace = next(
-                (
-                    workspace
-                    for workspace in output_workspaces
-                    if workspace["is_active"]
-                ),
-                None,
+            # Sort workspaces by their Niri index.
+            output_workspaces.sort(
+                key=lambda workspace: workspace["idx"]
             )
 
-            if active_workspace is not None:
-                workspace_name = active_workspace["name"]
+            if not output_workspaces:
+                continue
+
+            header_height = 65
+
+            available_height = height - header_height
+
+            workspace_height = (
+                available_height / len(output_workspaces)
+            )
+
+            for index, workspace in enumerate(output_workspaces):
+                workspace_y = (
+                    y
+                    + header_height
+                    + index * workspace_height
+                )
+
+                if workspace["is_active"]:
+                    workspace_pen = QPen(
+                        Qt.GlobalColor.white,
+                        3,
+                    )
+                else:
+                    workspace_pen = QPen(
+                        Qt.GlobalColor.gray,
+                        1,
+                    )
+
+                self.scene.addRect(
+                    x + 8,
+                    workspace_y,
+                    width - 16,
+                    workspace_height - 5,
+                    workspace_pen,
+                )
+
+                workspace_name = workspace["name"]
 
                 if workspace_name:
                     workspace_text = (
-                        f"Workspace {active_workspace['id']} "
+                        f"WS {workspace['id']} "
                         f"— {workspace_name}"
                     )
                 else:
                     workspace_text = (
-                        f"Workspace {active_workspace['id']}"
+                        f"WS {workspace['id']}"
                     )
+
+                if workspace["is_active"]:
+                    workspace_text += "  [ACTIVE]"
 
                 workspace_label = self.scene.addText(
                     workspace_text
                 )
 
                 workspace_label.setDefaultTextColor(
-                    Qt.GlobalColor.lightGray
+                    Qt.GlobalColor.white
+                    if workspace["is_active"]
+                    else Qt.GlobalColor.lightGray
                 )
 
                 workspace_label.setPos(
-                    x + 12,
-                    y + 35,
+                    x + 18,
+                    workspace_y + 4,
                 )
 
-                # Only show windows on the currently visible
-                # workspace for this monitor.
                 workspace_windows = [
                     window
                     for window in windows
                     if window["workspace_id"]
-                    == active_workspace["id"]
+                    == workspace["id"]
                 ]
 
-                card_y = y + 75
+                window_y = workspace_y + 30
 
                 for window in workspace_windows:
                     self.draw_window_card(
                         window,
-                        x + 15,
-                        card_y,
-                        width - 30,
+                        x + 18,
+                        window_y,
+                        width - 36,
                     )
 
-                    card_y += 75
+                    window_y += 65
 
         self.scene.setSceneRect(
             self.scene.itemsBoundingRect().adjusted(
@@ -179,7 +214,7 @@ class Dashboard(QMainWindow):
         )
 
     def draw_window_card(self, window, x, y, width):
-        card_height = 60
+        card_height = 52
 
         if window["is_focused"]:
             pen = QPen(Qt.GlobalColor.white, 3)
@@ -220,7 +255,7 @@ class Dashboard(QMainWindow):
 
         title_text.setPos(
             x + 8,
-            y + 28,
+            y + 24,
         )
 
 
