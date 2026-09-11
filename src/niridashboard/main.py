@@ -1,373 +1,197 @@
+"""Niri Dashboard alpha entry point."""
+import argparse
 import sys
+from pathlib import Path
 
-from PySide6.QtCore import QTimer, Qt
-from PySide6.QtGui import QBrush, QPen
-from PySide6.QtWidgets import (
-    QApplication,
-    QGraphicsItem,
-    QGraphicsRectItem,
-    QGraphicsScene,
-    QGraphicsTextItem,
-    QGraphicsView,
-    QMainWindow,
-)
+# Keep the original direct-script invocation working alongside python -m.
+if not __package__:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from niri import (
-    focus_window,
-    get_outputs,
-    get_windows,
-    get_workspaces,
-    move_window_to_workspace,
-)
+from PySide6.QtCore import Qt, QTimer
+from PySide6.QtGui import QKeySequence, QShortcut
+from PySide6.QtWidgets import QApplication, QHBoxLayout, QLabel, QLineEdit, QMainWindow, QPushButton, QVBoxLayout, QWidget
+from niridashboard.backend import Backend
+from niridashboard.graph import GraphView
+from niridashboard.icons import Icons
 
-
-class WorkspaceDropZone(QGraphicsRectItem):
-    def __init__(
-        self,
-        workspace_id,
-        x,
-        y,
-        width,
-        height,
-        pen,
-    ):
-        super().__init__(x, y, width, height)
-
-        self.workspace_id = workspace_id
-        self.normal_pen = pen
-        self.setPen(pen)
-
-    def set_drop_active(self, active):
-        if active:
-            self.setPen(QPen(Qt.GlobalColor.cyan, 4))
-        else:
-            self.setPen(self.normal_pen)
-
-
-class WindowCard(QGraphicsRectItem):
-    def __init__(
-        self,
-        window,
-        workspace_id,
-        width,
-        height,
-        pen,
-    ):
-        super().__init__(0, 0, width, height)
-
-        self.window_id = window["id"]
-        self.workspace_id = workspace_id
-        self.drag_start_position = None
-        self.active_drop_zone = None
-
-        self.setPen(pen)
-        self.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.setFlag(
-            QGraphicsItem.GraphicsItemFlag.ItemIsMovable,
-            True,
-        )
-
-        app_text = QGraphicsTextItem(window["app_id"], self)
-        app_text.setDefaultTextColor(Qt.GlobalColor.white)
-        app_text.setPos(8, 0)
-        app_text.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
-
-        title = window["title"]
-
-        if len(title) > 45:
-            title = title[:42] + "..."
-
-        title_text = QGraphicsTextItem(title, self)
-        title_text.setDefaultTextColor(Qt.GlobalColor.lightGray)
-        title_text.setPos(8, 22)
-        title_text.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
-
-    def mousePressEvent(self, event):
-        self.drag_start_position = self.pos()
-        super().mousePressEvent(event)
-
-    def mouseMoveEvent(self, event):
-        super().mouseMoveEvent(event)
-        self.set_active_drop_zone(
-            self.drop_zone_at(event.scenePos())
-        )
-
-    def mouseReleaseEvent(self, event):
-        drop_zone = self.drop_zone_at(event.scenePos())
-        moved = self.pos() != self.drag_start_position
-
-        super().mouseReleaseEvent(event)
-        self.set_active_drop_zone(None)
-        self.setPos(self.drag_start_position)
-
-        if moved:
-            if (
-                drop_zone is not None
-                and drop_zone.workspace_id != self.workspace_id
-            ):
-                move_window_to_workspace(
-                    self.window_id,
-                    drop_zone.workspace_id,
-                )
-        else:
-            focus_window(self.window_id)
-
-    def drop_zone_at(self, scene_position):
-        for item in self.scene().items(scene_position):
-            if isinstance(item, WorkspaceDropZone):
-                return item
-
-        return None
-
-    def set_active_drop_zone(self, drop_zone):
-        if drop_zone is self.active_drop_zone:
-            return
-
-        if self.active_drop_zone is not None:
-            self.active_drop_zone.set_drop_active(False)
-
-        self.active_drop_zone = drop_zone
-
-        if self.active_drop_zone is not None:
-            self.active_drop_zone.set_drop_active(True)
+STYLE = """
+QMainWindow, QWidget { background: #0c111c; color: #e5edf9; font-family: 'Sans Serif'; }
+QPushButton { background: #192437; border: 1px solid #30405a; border-radius: 7px; padding: 8px 13px; }
+QPushButton:hover { background: #293b53; border-color: #69dfc5; }
+QLineEdit { background: #141e2e; border: 1px solid #30405a; border-radius: 7px; padding: 9px; }
+QLabel#muted { color: #8191a9; }
+QLabel#error { color: #ffb1a8; background: #32212a; padding: 10px; border-radius: 6px; }
+QScrollBar:horizontal { height: 9px; background: #0c111c; }
+QScrollBar:vertical { width: 9px; background: #0c111c; }
+QScrollBar::handle { background: #30405a; border-radius: 4px; min-width: 24px; min-height: 24px; }
+QScrollBar::add-line, QScrollBar::sub-line { width: 0; height: 0; }
+"""
 
 
 class Dashboard(QMainWindow):
-    def __init__(self):
+    def __init__(self, demo=False, start_backend=True):
         super().__init__()
-
-        self.setWindowTitle("NiriDashBoard")
-        self.resize(1400, 800)
-
-        self.scene = QGraphicsScene()
-
-        self.view = QGraphicsView(self.scene)
-        self.view.setRenderHints(self.view.renderHints())
-        self.setCentralWidget(self.view)
-
+        self.setWindowTitle("Niri Dashboard")
+        self.resize(1440, 900)
+        self.setMinimumSize(760, 480)
+        self.setStyleSheet(STYLE)
+        self.pending = None
         self.last_state = None
+        self.error_kind = None
+        self.backend = Backend(demo)
+        self.view = GraphView(Icons())
+        root = QWidget()
+        layout = QVBoxLayout(root)
+        layout.setContentsMargins(24, 20, 24, 12)
+        layout.setSpacing(12)
+        header = QHBoxLayout()
+        title = QLabel("NIRI  /  DASHBOARD")
+        title.setStyleSheet("font-size: 19px; font-weight: 700; letter-spacing: 2px;")
+        header.addWidget(title)
+        badge = QLabel("ALPHA" + (" · DEMO" if demo else ""))
+        badge.setStyleSheet("color: #69dfc5; padding: 5px 9px; background: #19352f; border-radius: 5px;")
+        header.addWidget(badge)
+        header.addStretch()
+        self.search = QLineEdit()
+        self.search.setPlaceholderText("Find an app or window…  Ctrl+K")
+        self.search.setClearButtonEnabled(True)
+        self.search.setMaximumWidth(320)
+        self.search.textChanged.connect(self.filter_nodes)
+        self.search.returnPressed.connect(self.focus_match)
+        header.addWidget(self.search)
+        for label, callback in [("−", lambda: self.view.zoom(1 / 1.2)), ("+", lambda: self.view.zoom(1.2)), ("Fit  F", self.view.fit_graph), ("Fullscreen", self.toggle_fullscreen)]:
+            button = QPushButton(label)
+            button.clicked.connect(callback)
+            header.addWidget(button)
+        layout.addLayout(header)
+        self.summary = QLabel("Connecting to your desktop…")
+        self.summary.setObjectName("muted")
+        layout.addWidget(self.summary)
+        self.error = QLabel()
+        self.error.setObjectName("error")
+        self.error.setWordWrap(True)
+        self.error.hide()
+        layout.addWidget(self.error)
+        layout.addWidget(self.view, 1)
+        footer = QHBoxLayout()
+        self.status = QLabel("Starting…")
+        self.status.setStyleSheet("color: #69dfc5;")
+        footer.addWidget(self.status)
+        footer.addStretch()
+        self.help = QLabel("Drag to move · Click to focus · Wheel to zoom · Drag background to pan")
+        self.help.setObjectName("muted")
+        footer.addWidget(self.help)
+        self.zoom_label = QLabel("100%")
+        footer.addWidget(self.zoom_label)
+        layout.addLayout(footer)
+        self.setCentralWidget(root)
+        self.view.move_requested.connect(lambda wid, ws, before: self.command("move", wid, ws, before))
+        self.view.focus_requested.connect(lambda wid: self.command("focus", wid))
+        self.view.interaction_finished.connect(self.apply_pending)
+        self.view.hint.connect(self.set_hint)
+        self.view.zoom_changed.connect(lambda percent: self.zoom_label.setText(f"{percent}%"))
+        self.backend.state.connect(self.receive_state)
+        self.backend.health.connect(self.receive_health)
+        self.backend.finished_action.connect(self.action_finished)
+        self.shortcuts = []
+        for key, callback in [("Ctrl+K", self.search.setFocus), ("F11", self.toggle_fullscreen), ("Ctrl+0", self.view.fit_graph)]:
+            shortcut = QShortcut(QKeySequence(key), self)
+            shortcut.activated.connect(callback)
+            self.shortcuts.append(shortcut)
+        if start_backend:
+            self.backend.start()
 
-        self.refresh_dashboard()
+    def toggle_fullscreen(self):
+        self.showNormal() if self.isFullScreen() else self.showFullScreen()
 
-        self.timer = QTimer(self)
-        self.timer.timeout.connect(self.refresh_dashboard)
-        self.timer.start(500)
+    def set_hint(self, message):
+        self.help.setText(message or "Drag to move · Click to focus · Wheel to zoom · Drag background to pan")
 
-    def refresh_dashboard(self):
-        windows = get_windows()
-        workspaces = get_workspaces()
-        outputs = get_outputs()
-
-        current_state = (
-            repr(windows),
-            repr(workspaces),
-            repr(outputs),
-        )
-
-        if current_state == self.last_state:
+    def command(self, kind, *args):
+        if self.view.busy or not self.view.connected:
             return
+        self.view.busy = True
+        self.status.setText("Moving window…" if kind == "move" else "Focusing window…")
+        self.error.hide()
+        self.error_kind = None
+        self.backend.submit(kind, *args)
 
-        self.last_state = current_state
+    def action_finished(self, success, message):
+        self.view.busy = False
+        if not success:
+            self.error_kind = "action"
+            self.error.setText(f"Action could not finish: {message}. The graph reflects Niri’s actual state.")
+            self.error.show()
+        self.status.setText(message if success else "Action failed")
+        self.apply_pending()
 
-        self.draw_dashboard(windows, workspaces, outputs)
+    def receive_health(self, connected, message):
+        self.view.connected = connected
+        if not self.view.busy:
+            self.status.setText(message if connected else "Disconnected · retrying…")
+        if not connected:
+            self.error_kind = "connection"
+            self.error.setText(message)
+            self.error.show()
+            if self.view.pressed:
+                self.view.cancel_drag()
+                self.apply_pending()
+        elif self.error_kind == "connection":
+            self.error.hide()
+            self.error_kind = None
 
-    def draw_dashboard(self, windows, workspaces, outputs):
-        self.scene.clear()
+    def receive_state(self, data):
+        self.pending = data
+        self.apply_pending()
 
-        # Scale Niri desktop coordinates down to dashboard coordinates.
-        scale = 0.22
+    def apply_pending(self):
+        if self.pending is None or self.view.interacting or self.view.busy:
+            return
+        self.last_state = self.pending
+        self.pending = None
+        self.view.render(self.last_state)
+        self.filter_nodes()
+        data = self.last_state
+        count = sum(bool(o.get("logical")) for o in data["outputs"].values())
+        self.summary.setText(f"{count} monitors   /   {len(data['workspaces'])} workspaces   /   {len(data['windows'])} windows     ·     Your entire desktop, connected")
 
-        min_x = min(
-            output["logical"]["x"]
-            for output in outputs.values()
-            if output["logical"] is not None
-        )
+    def filter_nodes(self):
+        query = self.search.text().strip().casefold()
+        for node in self.view.nodes.values():
+            haystack = f"{node.label} {node.window.get('app_id') or ''} {node.window.get('title') or ''}".casefold()
+            node.setOpacity(1 if not query or query in haystack else 0.25)
 
-        min_y = min(
-            output["logical"]["y"]
-            for output in outputs.values()
-            if output["logical"] is not None
-        )
+    def focus_match(self):
+        query = self.search.text().strip()
+        if query:
+            node = next((n for n in self.view.nodes.values() if n.opacity() == 1), None)
+            if node:
+                self.command("focus", node.window["id"])
 
-        margin = 80
-
-        for output_name, output in outputs.items():
-            logical = output["logical"]
-
-            if logical is None:
-                continue
-
-            x = (logical["x"] - min_x) * scale + margin
-            y = (logical["y"] - min_y) * scale + margin
-
-            width = logical["width"] * scale
-            height = logical["height"] * scale
-
-            # Monitor body.
-            self.scene.addRect(
-                x,
-                y,
-                width,
-                height,
-                QPen(Qt.GlobalColor.white, 3),
-                QBrush(Qt.GlobalColor.black),
-            )
-
-            # Monitor name.
-            title = self.scene.addText(
-                f"{output_name} — {output['model']}"
-            )
-
-            title.setDefaultTextColor(Qt.GlobalColor.white)
-            title.setPos(x + 12, y + 8)
-
-            # Find workspaces belonging to this monitor.
-            output_workspaces = [
-                workspace
-                for workspace in workspaces
-                if workspace["output"] == output_name
-            ]
-
-            # Sort workspaces by their Niri index.
-            output_workspaces.sort(
-                key=lambda workspace: workspace["idx"]
-            )
-
-            if not output_workspaces:
-                continue
-
-            header_height = 65
-
-            available_height = height - header_height
-
-            workspace_height = (
-                available_height / len(output_workspaces)
-            )
-
-            for index, workspace in enumerate(output_workspaces):
-                workspace_y = (
-                    y
-                    + header_height
-                    + index * workspace_height
-                )
-
-                if workspace["is_active"]:
-                    workspace_pen = QPen(
-                        Qt.GlobalColor.white,
-                        3,
-                    )
-                else:
-                    workspace_pen = QPen(
-                        Qt.GlobalColor.gray,
-                        1,
-                    )
-
-                workspace_zone = WorkspaceDropZone(
-                    workspace["id"],
-                    x + 8,
-                    workspace_y,
-                    width - 16,
-                    workspace_height - 5,
-                    workspace_pen,
-                )
-
-                self.scene.addItem(workspace_zone)
-
-                workspace_name = workspace["name"]
-
-                if workspace_name:
-                    workspace_text = (
-                        f"WS {workspace['id']} "
-                        f"— {workspace_name}"
-                    )
-                else:
-                    workspace_text = (
-                        f"WS {workspace['id']}"
-                    )
-
-                if workspace["is_active"]:
-                    workspace_text += "  [ACTIVE]"
-
-                workspace_label = self.scene.addText(
-                    workspace_text
-                )
-
-                workspace_label.setDefaultTextColor(
-                    Qt.GlobalColor.white
-                    if workspace["is_active"]
-                    else Qt.GlobalColor.lightGray
-                )
-
-                workspace_label.setPos(
-                    x + 18,
-                    workspace_y + 4,
-                )
-
-                workspace_windows = [
-                    window
-                    for window in windows
-                    if window["workspace_id"]
-                    == workspace["id"]
-                ]
-
-                window_y = workspace_y + 30
-
-                for window in workspace_windows:
-                    self.draw_window_card(
-                        window,
-                        workspace["id"],
-                        x + 18,
-                        window_y,
-                        width - 36,
-                    )
-
-                    window_y += 65
-
-        self.scene.setSceneRect(
-            self.scene.itemsBoundingRect().adjusted(
-                -40,
-                -40,
-                40,
-                40,
-            )
-        )
-
-        self.view.fitInView(
-            self.scene.sceneRect(),
-            Qt.AspectRatioMode.KeepAspectRatio,
-        )
-
-    def draw_window_card(
-        self,
-        window,
-        workspace_id,
-        x,
-        y,
-        width,
-    ):
-        card_height = 52
-
-        if window["is_focused"]:
-            pen = QPen(Qt.GlobalColor.white, 3)
+    def closeEvent(self, event):
+        self.view.cancel_drag()
+        self.backend.stop()
+        if self.backend.isRunning():
+            # Keep the event loop responsive while bounded IPC finishes.
+            event.ignore()
+            self.hide()
+            QTimer.singleShot(100, self.close)
         else:
-            pen = QPen(Qt.GlobalColor.gray, 1)
-
-        card = WindowCard(
-            window,
-            workspace_id,
-            width,
-            card_height,
-            pen,
-        )
-
-        card.setPos(x, y)
-        card.setZValue(5)
-        self.scene.addItem(card)
+            event.accept()
 
 
-app = QApplication(sys.argv)
+def main():
+    parser = argparse.ArgumentParser(description="A connected map of your Niri desktop")
+    parser.add_argument("--demo", action="store_true", help="Interactive sample desktop; does not contact Niri")
+    parser.add_argument("--fullscreen", action="store_true", help="Fill the dashboard's current monitor")
+    args = parser.parse_args()
+    app = QApplication(sys.argv)
+    app.setApplicationName("niridashboard")
+    app.setDesktopFileName("niridashboard")
+    dashboard = Dashboard(demo=args.demo)
+    dashboard.showFullScreen() if args.fullscreen else dashboard.show()
+    return app.exec()
 
-dashboard = Dashboard()
-dashboard.show()
 
-sys.exit(app.exec())
+if __name__ == "__main__":
+    sys.exit(main())
