@@ -10,6 +10,7 @@ class Icons:
     def __init__(self):
         self.entries = {}
         self.cache = {}
+        seen = set()
         roots = [Path(os.environ.get("XDG_DATA_HOME", str(Path.home() / ".local/share")))]
         roots += [Path(p) for p in os.environ.get("XDG_DATA_DIRS", "/usr/local/share:/usr/share").split(":")]
         roots += [Path.home() / ".local/share/flatpak/exports/share", Path("/var/lib/flatpak/exports/share")]
@@ -23,9 +24,15 @@ class Icons:
                 try:
                     parser.read(file, encoding="utf-8")
                     entry = parser["Desktop Entry"]
+                    desktop_id = str(file.relative_to(root / "applications")).replace("/", "-")[:-8]
+                    if desktop_id in seen:
+                        continue
+                    seen.add(desktop_id)
+                    if entry.get("Hidden", "false").lower() == "true":
+                        continue
                     icon = entry.get("Icon", "")
                     label = entry.get("Name", file.stem)
-                    for key in (file.stem, entry.get("StartupWMClass", "")):
+                    for key in (desktop_id, file.stem, entry.get("StartupWMClass", "")):
                         if key:
                             self.entries.setdefault(key.lower(), (label, icon))
                 except (OSError, UnicodeError, configparser.Error, KeyError):

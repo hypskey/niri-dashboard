@@ -1,0 +1,19 @@
+// Install this rule before showing the overlay. Qt provides the title at mapping.
+window-rule {
+    match app-id="^niridashboard$" title="^niridashboard-overlay$"
+    open-floating true
+    // The overlay needs keyboard focus for Escape; NiriDashboard restores the
+    // window that was focused before opening when the overlay closes.
+    open-focused true
+    open-fullscreen false
+    open-maximized false
+    border { off; }
+    focus-ring { off; }
+    shadow { off; }
+}
+
+// Substitute the absolute repository path and choose a free shortcut.
+// spawn-at-startup "/absolute/path/niri-dashboard/bin/niridashboard" "serve" "--dashboard"
+// binds {
+//     Mod+Tab { spawn "/absolute/path/niri-dashboard/bin/niridashboard" "toggle-overlay"; }
+// }

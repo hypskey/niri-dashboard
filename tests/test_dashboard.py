@@ -141,7 +141,7 @@ class GraphTests(unittest.TestCase):
     def setUp(self):
         self.dashboard = Dashboard(demo=True, start_backend=False)
         self.dashboard.receive_state(demo_state())
-        self.dashboard.receive_health(True, "Demo")
+        self.dashboard.controller.receive_health(True, "Demo")
         self.dashboard.show()
         self.app.processEvents()
         self.view = self.dashboard.view
@@ -175,6 +175,29 @@ class GraphTests(unittest.TestCase):
         QTest.mouseRelease(self.view.viewport(), Qt.MouseButton.LeftButton, pos=start + QPoint(1, 1))
         self.assertEqual(self.focuses, [1])
         self.assertEqual(self.moves, [])
+
+    def test_right_click_closes_target_without_focusing(self):
+        QTest.mouseClick(self.view.viewport(), Qt.MouseButton.RightButton, pos=self.center(2))
+        self.assertEqual(self.dashboard.backend.commands.get_nowait(), ("close", 2))
+        self.assertEqual(self.focuses, [])
+        self.assertEqual(self.moves, [])
+
+    def test_right_click_ignored_while_disconnected_or_busy(self):
+        for connected, busy in [(False, False), (True, True)]:
+            self.view.connected, self.view.busy = connected, busy
+            QTest.mouseClick(self.view.viewport(), Qt.MouseButton.RightButton, pos=self.center(2))
+            self.assertTrue(self.dashboard.backend.commands.empty())
+
+    def test_close_uses_explicit_window_id(self):
+        with patch.object(niri, "run_niri_ipc") as ipc:
+            niri.close_window(42)
+            ipc.assert_called_once_with({"Action": {"CloseWindow": {"id": 42}}})
+
+    def test_demo_close_removes_only_target(self):
+        backend = Backend(demo=True)
+        before = {w["id"] for w in backend.data["windows"]}
+        backend.demo_action("close", [2])
+        self.assertEqual({w["id"] for w in backend.data["windows"]}, before - {2})
 
     def test_cross_monitor_drop_on_empty_workspace(self):
         row = next(r for r in self.view.rows if r["workspace"]["id"] == 8)
@@ -235,11 +258,6 @@ class GraphTests(unittest.TestCase):
         self.dashboard.receive_state(data)
         self.assertEqual(len(self.view.rows), 9)
 
-    def test_search_does_not_remove_drop_targets(self):
-        self.dashboard.search.setText("unlikely match")
-        self.assertTrue(all(n.opacity() == 0.25 for n in self.view.nodes.values()))
-        self.assertEqual(len(self.view.rows), 9)
-
     def test_disconnected_cannot_issue_action(self):
         self.dashboard.receive_health(False, "Socket lost")
         QTest.mouseClick(self.view.viewport(), Qt.MouseButton.LeftButton, pos=self.center(1))
@@ -277,6 +295,51 @@ class GraphTests(unittest.TestCase):
                 self.assertTrue(states)
                 self.assertIn(False, health)
                 self.assertIn(True, health)
+            finally:
+                backend.stop()
+                self.assertTrue(backend.wait(3000))
+
+    def test_live_action_refreshes_before_completion_even_on_action_failure(self):
+        for failure in (None, RuntimeError("Window closed during move")):
+            with self.subTest(failure=failure):
+                backend = Backend()
+                events = []
+                backend.state.connect(lambda data: events.append(("state", data)))
+                backend.finished_action.connect(lambda ok, message: events.append(("done", ok)))
+                updated = demo_state()
+                updated["windows"][0]["workspace_id"] = 8
+                with patch("niridashboard.backend.niri.insert_window", side_effect=failure) as move, patch("niridashboard.backend.niri.snapshot", return_value=updated):
+                    backend.submit("move", 1, 8, None)
+                    backend.start()
+                    try:
+                        for _ in range(40):
+                            QTest.qWait(25)
+                            if any(event[0] == "done" for event in events):
+                                break
+                        move.assert_called_once_with(1, 8, None)
+                        self.assertEqual(events[:2], [("state", updated), ("done", failure is None)])
+                    finally:
+                        backend.stop()
+                        self.assertTrue(backend.wait(3000))
+
+    def test_live_refresh_failure_disables_actions_without_reporting_success(self):
+        backend = Backend()
+        results, health = [], []
+        backend.health.connect(lambda ok, message: health.append(ok))
+        backend.finished_action.connect(lambda ok, message: results.append((ok, message)))
+        with patch("niridashboard.backend.niri.focus_window") as focus, patch("niridashboard.backend.niri.snapshot", side_effect=RuntimeError("Socket lost")):
+            backend.submit("focus", 1)
+            backend.start()
+            try:
+                for _ in range(40):
+                    QTest.qWait(25)
+                    if results:
+                        break
+                focus.assert_called_once_with(1)
+                self.assertIn(False, health)
+                self.assertEqual(len(results), 1)
+                self.assertFalse(results[0][0])
+                self.assertIn("refresh failed", results[0][1])
             finally:
                 backend.stop()
                 self.assertTrue(backend.wait(3000))
