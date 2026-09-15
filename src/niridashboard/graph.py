@@ -3,25 +3,35 @@ import math
 from PySide6.QtCore import QPointF, QRectF, Qt, Signal, QTimer
 from PySide6.QtGui import QColor, QFont, QPainter, QPainterPath, QPen, QCursor, QLinearGradient
 from PySide6.QtWidgets import QApplication, QGraphicsLineItem, QGraphicsItem, QGraphicsObject, QGraphicsScene, QGraphicsView
+from .appearance import DEFAULT_PALETTE, DashboardSettings
+from .hints import HintAssignments
 from .niri import ordered, position
 
-BG = "#f5f2ed"
-TEXT = "#434853"
-MUTED = "#737681"
-COLORS = ["#a9cdbf", "#b9b6dd", "#dfbca7", "#d7b4c9"]
+BG = DEFAULT_PALETTE.dashboard_background
+TEXT = DEFAULT_PALETTE.primary_text
+MUTED = DEFAULT_PALETTE.secondary_text
+COLORS = list(DEFAULT_PALETTE.pipe_colors)
 NODE_W, NODE_H, STEP, ROW = 108, 100, 136, 144
 
 
-def font(size, bold=False):
-    return QFont("Sans Serif", size, QFont.Weight.DemiBold if bold else QFont.Weight.Normal)
+def font(size, bold=False, settings=None):
+    settings = settings or DashboardSettings()
+    return QFont(settings.font_family, size, QFont.Weight.DemiBold if bold else QFont.Weight.Normal)
 
 
 class AppNode(QGraphicsObject):
-    def __init__(self, window, icons, color):
+    def __init__(self, window, icons, color, hint=None, palette=None, settings=None):
         super().__init__()
         self.window = window
-        self.label, self.icon = icons.resolve(window.get("app_id"))
+        self.icons = icons
+        self.label, self.icon = icons.resolve_for_window(
+            window.get("app_id"), window.get("title"), window.get("browser_hostname"))
         self.color = color
+        self.hint = str(hint) if hint is not None else ""
+        self.palette = palette or DEFAULT_PALETTE
+        self.settings = settings or DashboardSettings()
+        self.width = self.settings.node_width
+        self.height = self.settings.node_height
         self.hovered = False
         self.setAcceptHoverEvents(True)
         self.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
@@ -32,38 +42,54 @@ class AppNode(QGraphicsObject):
         self.setToolTip(f"{self.label}\n{window.get('title') or 'Untitled window'}\n{detail}\nDrag to a workspace or between apps")
 
     def boundingRect(self):
-        return QRectF(-3, -3, NODE_W + 6, NODE_H + 6)
+        return QRectF(-3, -3, self.width + 6, self.height + 6)
 
     def paint(self, p, option, widget=None):
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         focused = self.window.get("is_focused")
-        # A softly shaded circular badge; the labels sit directly on the canvas.
-        p.setPen(Qt.PenStyle.NoPen)
-        for spread, alpha in [(3, 6), (1.5, 10)]:
-            p.setBrush(QColor(72, 64, 58, alpha))
-            p.drawEllipse(QRectF(27 - spread, 3 - spread, 54 + spread * 2, 54 + spread * 2))
-        gradient = QLinearGradient(34, 0, 72, 54)
-        gradient.setColorAt(0, QColor("#fffcf8"))
-        gradient.setColorAt(1, QColor(self.color).lighter(116))
+        icon_size = self.settings.icon_size
+        icon_x = (self.width - icon_size) / 2
+        p.setFont(font(self.settings.hint_badge_font_size, True, self.settings))
+        badge_width = max(20, p.fontMetrics().horizontalAdvance(self.hint) + 10)
+        badge_rect = QRectF(self.width - badge_width, 0, badge_width, 20)
+        base = QColor(self.palette.focused_background if focused else self.palette.node_background)
+        gradient = QLinearGradient(icon_x, 0, icon_x + icon_size, icon_size)
+        gradient.setColorAt(0, base.lighter(108))
+        gradient.setColorAt(1, base.darker(108))
         p.setBrush(gradient)
-        p.setPen(QPen(QColor(self.color).darker(115) if focused or self.hovered else QColor("#ffffff"), 2 if focused else 1))
-        p.drawEllipse(QRectF(27, 0, 54, 54))
-        self.icon.paint(p, 35, 8, 38, 38)
-        p.setFont(font(9, True))
-        p.setPen(QColor(TEXT))
-        label = p.fontMetrics().elidedText(self.label, Qt.TextElideMode.ElideRight, NODE_W - 12)
-        p.drawText(QRectF(6, 56, NODE_W - 12, 18), Qt.AlignmentFlag.AlignCenter, label)
-        p.setFont(font(8))
-        p.setPen(QColor(MUTED))
-        title = p.fontMetrics().elidedText(self.window.get("title") or "Untitled", Qt.TextElideMode.ElideRight, NODE_W - 12)
-        p.drawText(QRectF(6, 77, NODE_W - 12, 16), Qt.AlignmentFlag.AlignCenter, title)
+        border = self.palette.focused_border if focused or self.hovered else self.palette.node_border
+        p.setPen(QPen(QColor(border), 2 if focused else 1))
+        p.drawEllipse(QRectF(icon_x - 8, 0, icon_size + 16, icon_size + 16))
+        p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+        pixmap = self.icons.rendered(
+            self.window.get("app_id"), icon_size, self.window.get("title"),
+            self.window.get("browser_hostname"))
+        if not pixmap.isNull():
+            pixmap_size = pixmap.deviceIndependentSize()
+            px = icon_x + (icon_size - pixmap_size.width()) / 2
+            py = 8 + (icon_size - pixmap_size.height()) / 2
+            p.drawPixmap(QPointF(px, py), pixmap)
+        p.setFont(font(self.settings.application_title_size, True, self.settings))
+        p.setPen(QColor(self.palette.focused_text if focused else self.palette.application_title))
+        label = p.fontMetrics().elidedText(self.label, Qt.TextElideMode.ElideRight, self.width - 12)
+        p.drawText(QRectF(6, icon_size + 18, self.width - 12, 18), Qt.AlignmentFlag.AlignCenter, label)
+        p.setFont(font(self.settings.window_title_size, settings=self.settings))
+        p.setPen(QColor(self.palette.window_title))
+        title = p.fontMetrics().elidedText(self.window.get("title") or "Untitled", Qt.TextElideMode.ElideRight, self.width - 12)
+        p.drawText(QRectF(6, icon_size + 38, self.width - 12, 16), Qt.AlignmentFlag.AlignCenter, title)
         if self.window.get("is_floating"):
-            p.setPen(QColor(self.color))
-            p.drawText(QRectF(84, 4, 18, 16), Qt.AlignmentFlag.AlignCenter, "~")
+            p.setPen(QColor(self.palette.secondary_text))
+            p.drawText(QRectF(2, 2, 18, 16), Qt.AlignmentFlag.AlignCenter, "~")
         if self.window.get("is_urgent"):
             p.setPen(Qt.PenStyle.NoPen)
-            p.setBrush(QColor("#bd8053"))
-            p.drawEllipse(QPointF(96, 12), 4, 4)
+            p.setBrush(QColor(self.palette.pipe_colors[2]))
+            p.drawEllipse(QPointF(self.width - 5, self.height - 5), 4, 4)
+        if self.hint:
+            p.setPen(QPen(QColor(self.palette.hint_border), 1))
+            p.setBrush(QColor(self.palette.hint_background))
+            p.drawRoundedRect(badge_rect, 5, 5)
+            p.setPen(QColor(self.palette.hint_text))
+            p.drawText(badge_rect, Qt.AlignmentFlag.AlignCenter, self.hint)
 
     def hoverEnterEvent(self, event):
         self.hovered = True
@@ -82,12 +108,18 @@ class GraphView(QGraphicsView):
     interaction_finished = Signal()
     hint = Signal(str)
     zoom_changed = Signal(int)
+    numeric_pressed = Signal(str)
 
-    def __init__(self, icons, translucent=False):
+    def __init__(self, icons, translucent=False, appearance=None):
         super().__init__()
         self.setScene(QGraphicsScene(self))
         self.icons = icons
         self.translucent = translucent
+        self.numeric_selection_enabled = False
+        self.appearance = appearance
+        self.colors = appearance.palette if appearance else DEFAULT_PALETTE
+        self.settings = appearance.settings if appearance else DashboardSettings()
+        self.hint_assignments = HintAssignments()
         self.nodes = {}
         self.rows = []
         self.data = None
@@ -99,9 +131,11 @@ class GraphView(QGraphicsView):
         self.drop = None
         self.marker = None
         self.auto_fit = True
+        self.background_grid = True
+        self.appearance_pending = False
         self.space = False
         self.setRenderHint(QPainter.RenderHint.Antialiasing)
-        self.setBackgroundBrush(Qt.BrushStyle.NoBrush if translucent else QColor(BG))
+        self.setBackgroundBrush(Qt.BrushStyle.NoBrush if translucent else QColor(self.colors.dashboard_background))
         if translucent:
             self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, True)
             self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, False)
@@ -122,14 +156,37 @@ class GraphView(QGraphicsView):
         self.edge_timer = QTimer(self)
         self.edge_timer.setInterval(16)
         self.edge_timer.timeout.connect(self.edge_pan)
+        self.interaction_finished.connect(self._finish_appearance_update)
 
     @property
     def interacting(self):
         return self.pressed is not None or self.panning
 
-    def text(self, text, x, y, size=10, color=TEXT, bold=False):
-        item = self.scene().addSimpleText(text, font(size, bold))
-        item.setBrush(QColor(color).darker(155) if color in COLORS else QColor(color))
+    def set_appearance(self):
+        if self.appearance:
+            self.colors = self.appearance.palette
+            self.settings = self.appearance.settings
+        if not self.translucent:
+            self.setBackgroundBrush(QColor(self.colors.dashboard_background))
+            widget_palette = QGraphicsView.palette(self)
+            widget_palette.setColor(widget_palette.ColorRole.Window, QColor(self.colors.dashboard_background))
+            self.setPalette(widget_palette)
+        if self.data is not None:
+            if self.interacting:
+                self.appearance_pending = True
+            else:
+                self.render(self.data)
+
+    def _finish_appearance_update(self):
+        if self.appearance_pending and not self.interacting and self.data is not None:
+            self.appearance_pending = False
+            self.render(self.data)
+
+    def text(self, text, x, y, size=None, color=None, bold=False):
+        size = size if size is not None else self.settings.normal_text_size
+        color = color or self.colors.primary_text
+        item = self.scene().addSimpleText(text, font(size, bold, self.settings))
+        item.setBrush(QColor(color))
         item.setPos(x, y)
         item.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
         return item
@@ -141,7 +198,9 @@ class GraphView(QGraphicsView):
         item.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
         # Child strokes follow insertion markers and are removed with their parent.
         shadow = QGraphicsLineItem(x1, y1 + 1, x2, y2 + 1, item)
-        shadow.setPen(QPen(QColor(88, 76, 68, 20), width + 1, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+        shadow_color = QColor(self.colors.secondary_text)
+        shadow_color.setAlpha(28)
+        shadow.setPen(QPen(shadow_color, width + 1, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
         shadow.setZValue(-1)
         shadow.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
         return item
@@ -160,49 +219,61 @@ class GraphView(QGraphicsView):
             if ws.get("output") not in names:
                 names.append(ws.get("output"))
         if not names:
-            self.text("Your desktop will appear here", 20, 20, 20, bold=True)
-            self.text("Waiting for an active monitor and its workspaces.", 20, 60, 11, MUTED)
-        x = 32
-        for branch, name in enumerate(names):
-            color = COLORS[branch % len(COLORS)]
+            self.text("Your desktop will appear here", 20, 20, self.settings.output_label_size, self.colors.primary_text, True)
+            self.text("Waiting for an active monitor and its workspaces.", 20, 60, self.settings.normal_text_size, self.colors.secondary_text)
+        branches = []
+        ordered_window_ids = []
+        for name in names:
             workspaces = sorted([w for w in data["workspaces"] if w.get("output") == name], key=lambda w: w["idx"])
             groups = [ordered([w for w in data["windows"] if w.get("workspace_id") == ws["id"]]) for ws in workspaces]
-            width = max(370, 152 + max((len(w) for w in groups), default=0) * STEP)
-            self.line(x + 20, 67, x + 20, 114 + max(0, len(workspaces) - 1) * ROW + 27, color, 3)
-            self.text(f"{branch + 1:02d}  /  {name or 'Unassigned'}", x, 8, 15, color, True)
+            ordered_window_ids.extend(window["id"] for group in groups for window in group)
+            branches.append((name, workspaces, groups))
+        hint_by_id = self.hint_assignments.update(ordered_window_ids)
+        x = self.settings.graph_padding
+        for branch, (name, workspaces, groups) in enumerate(branches):
+            color = self.colors.pipe_colors[branch % len(self.colors.pipe_colors)]
+            step, row_height = self.settings.workspace_step, self.settings.workspace_row
+            width = max(self.settings.node_width + 262, 152 + max((len(w) for w in groups), default=0) * step)
+            self.line(x + 20, 67, x + 20, 114 + max(0, len(workspaces) - 1) * row_height + 27, color, 3)
+            self.text(f"{branch + 1:02d}  /  {name or 'Unassigned'}", x, 8, self.settings.output_label_size, self.colors.output_label, True)
             model = outputs.get(name, {}).get("model") or "Workspace branch"
-            self.text(f"{model}  ·  {len(workspaces)} workspaces", x, 38, 9, MUTED)
+            self.text(f"{model}  ·  {len(workspaces)} workspaces", x, 38, self.settings.normal_text_size, self.colors.secondary_text)
             for row, (ws, windows) in enumerate(zip(workspaces, groups)):
-                y = 114 + row * ROW
+                y = 114 + row * row_height
                 self.line(x + 20, y + 27, x + 137, y + 27, color)
-                dot = self.scene().addEllipse(x + 14, y + 21, 12, 12, QPen(QColor(color), 2), QColor(color if ws.get("is_active") else BG))
+                dot_fill = color if ws.get("is_active") else self.colors.dashboard_background
+                dot = self.scene().addEllipse(x + 14, y + 21, 12, 12, QPen(QColor(color), 2), QColor(dot_fill))
                 dot.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
-                self.text(f"{ws['idx']:02d}", x - 4, y + 4, 11, color, True)
-                label = ws.get("name") or f"Workspace {ws['idx']}"
-                self.text(label[:27] + ("…" if len(label) > 27 else ""), x + 52, y - 25, 10, TEXT, True)
+                self.text(f"{ws['idx']:02d}", x - 4, y + 4, self.settings.workspace_number_size, self.colors.workspace_number, True)
                 start = x + 110
-                rect = QRectF(x + 45, y - 5, width - 45, 115)
+                rect = QRectF(x + 45, y - 5, width - 45, self.settings.node_height + 15)
                 self.rows.append({"workspace": ws, "rect": rect, "start": start, "y": y, "windows": windows, "color": color})
                 if not windows:
-                    placeholder = self.scene().addEllipse(QRectF(start + 27, y, 54, 54), QPen(QColor(color), 1, Qt.PenStyle.DashLine))
+                    placeholder_size = min(54, self.settings.icon_size + 16)
+                    placeholder = self.scene().addEllipse(QRectF(start + 27, y, placeholder_size, placeholder_size), QPen(QColor(color), 1, Qt.PenStyle.DashLine))
                     placeholder.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
-                    plus = self.text("+", start, y, 22, MUTED)
-                    plus.setPos(start + 54 - plus.boundingRect().width() / 2, y + 27 - plus.boundingRect().height() / 2)
+                    plus = self.text("+", start, y, 22, self.colors.secondary_text)
+                    plus.setPos(start + placeholder_size - plus.boundingRect().width() / 2, y + placeholder_size / 2 - plus.boundingRect().height() / 2)
                 for index, window in enumerate(windows):
-                    nx = start + index * STEP
+                    nx = start + index * step
                     if index:
-                        self.line(nx - STEP + 81, y + 27, nx + 27, y + 27, color)
-                    node = AppNode(window, self.icons, color)
+                        self.line(nx - step + self.settings.node_width - 27, y + 27, nx + 27, y + 27, color)
+                    node = AppNode(window, self.icons, color, hint_by_id.get(window["id"]), self.colors, self.settings)
                     node.setPos(nx, y)
                     self.scene().addItem(node)
                     self.nodes[window["id"]] = node
                     pos = position(window)
                     if pos and sum(bool(position(w)) and position(w)[0] == pos[0] for w in windows) > 1:
-                        self.text(f"STACK {pos[0]} · {pos[1]}", nx + 15, y + 104, 7, MUTED)
-            x += width + 60
-        self.scene().setSceneRect(self.scene().itemsBoundingRect().adjusted(-45, -45, 75, 65))
+                        self.text(f"STACK {pos[0]} · {pos[1]}", nx + 15, y + self.settings.node_height + 4, max(6, self.settings.normal_text_size - 2), self.colors.secondary_text)
+            x += width + self.settings.branch_gap
+        padding = self.settings.graph_padding
+        self.scene().setSceneRect(self.scene().itemsBoundingRect().adjusted(-padding, -padding, padding + 30, padding + 30))
         if self.auto_fit:
             self.fit_graph()
+
+    @property
+    def hint_targets(self):
+        return {str(hint): window_id for window_id, hint in self.hint_assignments.by_window.items()}
 
     def fit_graph(self):
         self.auto_fit = True
@@ -292,7 +363,7 @@ class GraphView(QGraphicsView):
                 continue
             # Anchors use original node coordinates, even while the dragged node moves.
             candidates = [(i, w) for i, w in enumerate(row["windows"]) if w["id"] != self.pressed.window["id"]]
-            before = next(((i, w) for i, w in candidates if scene_pos.x() < row["start"] + i * STEP + NODE_W / 2), None)
+            before = next(((i, w) for i, w in candidates if scene_pos.x() < row["start"] + i * self.settings.workspace_step + self.settings.node_width / 2), None)
             if before and position(before[1]):
                 # A tiled insertion is between columns, never inside an existing stack.
                 column = position(before[1])[0]
@@ -302,10 +373,10 @@ class GraphView(QGraphicsView):
                 before = None
             anchor = before[1]["id"] if before else None
             self.drop = row["workspace"]["id"], anchor
-            mx = row["start"] + (before[0] * STEP if before else len(row["windows"]) * STEP) - 14
-            self.marker = self.line(mx, row["y"] - 5, mx, row["y"] + NODE_H + 5, row["color"], 4)
+            mx = row["start"] + (before[0] * self.settings.workspace_step if before else len(row["windows"]) * self.settings.workspace_step) - 14
+            self.marker = self.line(mx, row["y"] - 5, mx, row["y"] + self.settings.node_height + 5, row["color"], 4)
             self.marker.setZValue(40)
-            destination = row["workspace"].get("name") or f"Workspace {row['workspace']['idx']}"
+            destination = f"{row['workspace']['idx']:02d}"
             where = f"before {self.icons.resolve(before[1].get('app_id'))[0]}" if before else "at the end"
             self.hint.emit(f"Move to {row['workspace'].get('output') or 'unassigned'} / {destination} · {where}")
             break
@@ -364,6 +435,9 @@ class GraphView(QGraphicsView):
             self.cancel_drag()
             self.interaction_finished.emit()
             self.escape_pressed.emit()
+        elif self.numeric_selection_enabled and event.text() in "0123456789" and len(event.text()) == 1:
+            self.numeric_pressed.emit(event.text())
+            event.accept()
         elif event.key() == Qt.Key.Key_Space:
             self.space = True
             self.setCursor(Qt.CursorShape.OpenHandCursor)
@@ -390,8 +464,12 @@ class GraphView(QGraphicsView):
         if self.translucent:
             # Leave untouched pixels at alpha 0 so Niri's desktop shows through.
             return
-        p.fillRect(rect, QColor(BG))
-        p.setPen(QPen(QColor("#e3dfd8"), 1))
+        p.fillRect(rect, QColor(self.colors.dashboard_background))
+        if not self.background_grid:
+            return
+        grid_color = QColor(self.colors.secondary_text)
+        grid_color.setAlpha(22)
+        p.setPen(QPen(grid_color, 1))
         step = 28 if self.transform().m11() > 0.4 else 56
         for x in range(math.floor(rect.left() / step) * step, math.ceil(rect.right()), step):
             for y in range(math.floor(rect.top() / step) * step, math.ceil(rect.bottom()), step):

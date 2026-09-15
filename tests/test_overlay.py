@@ -1,4 +1,5 @@
 import os
+from dataclasses import replace
 import threading
 import tempfile
 import stat
@@ -7,12 +8,13 @@ from unittest.mock import patch
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from PySide6.QtCore import QRectF, Qt
 from PySide6.QtGui import QColor, QImage, QPainter
+from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication
 from niridashboard.backend import Backend, demo_state
 from niridashboard.controller import DashboardController
 from niridashboard.graph import GraphView, COLORS
 from niridashboard.main import Dashboard
-from niridashboard.overlay import OverlayWindow
+from niridashboard.overlay import OverlayWindow, overlay_size
 from niridashboard import niri
 
 
@@ -21,8 +23,10 @@ class OverlayTests(unittest.TestCase):
     def setUpClass(cls):
         cls.app = QApplication.instance() or QApplication([])
 
-    def make_window(self):
+    def make_window(self, opacity=1.0):
         controller = DashboardController(demo=True, start_backend=False)
+        controller.appearance.settings = replace(controller.appearance.settings, overlay_opacity=opacity)
+        controller.receive_state(controller.backend.data)
         controller.connected = True
         controller.health_message = "Demo"
         jobs = []
@@ -33,44 +37,95 @@ class OverlayTests(unittest.TestCase):
     def tearDown(self):
         self.app.processEvents()
 
-    def test_overlay_graph_paint_is_transparent_and_persistent_graph_stays_opaque(self):
-        overlay = GraphView(None, translucent=True)
-        persistent = GraphView(None)
-        self.assertEqual(overlay.backgroundBrush().style(), Qt.BrushStyle.NoBrush)
-        self.assertFalse(overlay.autoFillBackground())
-        self.assertFalse(overlay.viewport().autoFillBackground())
-        self.assertEqual(overlay.viewport().palette().color(overlay.viewport().palette().ColorRole.Window).alpha(), 0)
-
-        image = QImage(160, 100, QImage.Format.Format_ARGB32_Premultiplied)
-        image.fill(Qt.GlobalColor.transparent)
-        painter = QPainter(image)
-        overlay.drawBackground(painter, QRectF(0, 0, 160, 100))
-        painter.end()
-        self.assertEqual(image.pixelColor(80, 50).alpha(), 0)
-
-        persistent_image = QImage(160, 100, QImage.Format.Format_ARGB32_Premultiplied)
-        persistent_image.fill(Qt.GlobalColor.transparent)
-        painter = QPainter(persistent_image)
-        persistent.drawBackground(painter, QRectF(0, 0, 160, 100))
-        painter.end()
-        self.assertEqual(persistent_image.pixelColor(80, 50).alpha(), 255)
-
-    def test_overlay_window_container_backgrounds_are_transparent(self):
+    def test_overlay_background_is_opaque_and_tracks_dashboard_theme(self):
         controller, overlay, jobs = self.make_window()
-        root = overlay.centralWidget()
-        for widget in (overlay, root, overlay.view, overlay.view.viewport()):
-            self.assertFalse(widget.autoFillBackground())
-            self.assertTrue(widget.testAttribute(Qt.WidgetAttribute.WA_NoSystemBackground))
-        self.assertTrue(overlay.testAttribute(Qt.WidgetAttribute.WA_TranslucentBackground))
-        self.assertNotIn("background:", overlay.error.styleSheet())
+        self.assertFalse(overlay.testAttribute(Qt.WidgetAttribute.WA_TranslucentBackground))
+        self.assertFalse(overlay.view.translucent)
+        for color in (controller.appearance.palette.dashboard_background, "#314159"):
+            controller.appearance.palette = replace(controller.appearance.palette, dashboard_background=color)
+            controller.appearance_changed.emit()
+            for widget in (overlay, overlay.centralWidget(), overlay.view, overlay.view.viewport()):
+                self.assertEqual(widget.palette().color(widget.palette().ColorRole.Window).name(), color)
+                self.assertEqual(widget.palette().color(widget.palette().ColorRole.Window).alpha(), 255)
+            image = QImage(160, 100, QImage.Format.Format_ARGB32_Premultiplied)
+            image.fill(Qt.GlobalColor.transparent)
+            painter = QPainter(image)
+            overlay.view.drawBackground(painter, QRectF(0, 0, 160, 100))
+            painter.end()
+            self.assertEqual(image.pixelColor(80, 50), QColor(color))
         self.assertEqual(overlay.windowTitle(), niri.OVERLAY_TITLE)
         overlay.shutdown()
-        overlay.close()
+
+    def test_overlay_opacity_paints_once_and_keeps_scene_items_opaque(self):
+        for opacity in (0.0, 0.8):
+            with self.subTest(opacity=opacity):
+                controller = DashboardController(demo=True, start_backend=False)
+                controller.appearance.settings = replace(controller.appearance.settings, overlay_opacity=opacity)
+                overlay = OverlayWindow(controller)
+                overlay.error.hide()
+                overlay.resize(400, 300)
+                overlay.centralWidget().layout().activate()
+                overlay.view.scene().addRect(QRectF(0, 0, 80, 80), Qt.PenStyle.NoPen, QColor("red"))
+                overlay.view.setSceneRect(-100, -100, 280, 280)
+                overlay.view.fit_graph()
+                self.assertEqual(overlay.windowOpacity(), 1.0)
+                for color in ("#314159", "#182838"):
+                    controller.appearance.palette = replace(controller.appearance.palette, dashboard_background=color)
+                    controller.appearance_changed.emit()
+                    image = QImage(overlay.size(), QImage.Format.Format_ARGB32_Premultiplied)
+                    image.fill(Qt.GlobalColor.transparent)
+                    overlay.render(image)
+                    self.assertAlmostEqual(image.pixelColor(2, 2).alpha(), round(opacity * 255), delta=1)
+                    self.assertEqual(image.pixelColor(image.width() // 2, image.height() // 2), QColor("red"))
+                    if opacity:
+                        actual, expected = image.pixelColor(2, 2), QColor(color)
+                        for channel in ("red", "green", "blue"):
+                            self.assertAlmostEqual(getattr(actual, channel)(), getattr(expected, channel)(), delta=1)
+                overlay.shutdown()
+                overlay.deleteLater()
+
+    def test_overlay_size_follows_graph_and_caps_large_graphs(self):
+        logical = {"width": 1920, "height": 1080}
+        self.assertEqual(overlay_size(QRectF(0, 0, 900, 450), logical), (908, 458))
+        width, height = overlay_size(QRectF(0, 0, 3000, 1500), logical)
+        self.assertLessEqual(width, round(1920 * .86))
+        self.assertLessEqual(height, round(1080 * .86))
+        self.assertAlmostEqual((width - 8) / (height - 8), 2, places=2)
+        self.assertEqual(overlay_size(QRectF(), logical), (360, 220))
+        width, height = overlay_size(QRectF(0, 0, 400, 1800), {"width": 800, "height": 1200})
+        self.assertLessEqual(width, 688)
+        self.assertLessEqual(height, 1032)
+
+    def test_overlay_size_uses_settings_and_monitor_limits(self):
+        from niridashboard.appearance import DashboardSettings
+        settings = replace(DashboardSettings(), overlay_max_width_percent=60,
+                           overlay_max_height_percent=50, overlay_min_width=500, overlay_min_height=300)
+        logical = {"width": 1920, "height": 1080}
+        self.assertEqual(overlay_size(QRectF(), logical, settings), (500, 300))
+        width, height = overlay_size(QRectF(0, 0, 3000, 1800), logical, settings)
+        self.assertLessEqual(width, 1152)
+        self.assertLessEqual(height, 540)
+        oversized = replace(settings, overlay_min_width=7000, overlay_min_height=4000)
+        self.assertEqual(overlay_size(QRectF(), logical, oversized), (1152, 540))
+
+    def test_open_sizes_cached_scene_before_mapping(self):
+        controller, overlay, jobs = self.make_window()
+        controller.appearance.settings = replace(controller.appearance.settings, overlay_max_width_percent=65,
+                                                 overlay_max_height_percent=60)
+        overlay.toggle()
+        expected = overlay_size(overlay.view.sceneRect(), overlay.context["logical"], controller.appearance.settings)
+        logical = overlay.context["logical"]
+        expected = (min(round(expected[0] * 1.2), round(logical["width"] * .96)),
+                    min(round(expected[1] * 1.2), round(logical["height"] * .96)))
+        self.assertEqual(overlay.context["overlay_size"], expected)
+        self.assertEqual((overlay.width(), overlay.height()), expected)
+        overlay.dismiss()
+        overlay.hide()
 
     def test_persistent_dashboard_keeps_background_and_dashboard_scene(self):
         dashboard = Dashboard(demo=True, start_backend=False)
         self.assertFalse(dashboard.view.translucent)
-        self.assertEqual(dashboard.view.backgroundBrush().color().name(), "#f5f2ed")
+        self.assertEqual(dashboard.view.backgroundBrush().color().name(), dashboard.controller.appearance.palette.dashboard_background)
         dashboard.close()
 
     def test_overlay_identity_filter_does_not_filter_other_niri_windows(self):
@@ -97,31 +152,28 @@ class OverlayTests(unittest.TestCase):
     def test_rapid_open_cancel_and_reopen_do_not_leave_late_overlay(self):
         controller, overlay, jobs = self.make_window()
         overlay.toggle()
-        self.assertEqual(overlay.phase, "capturing")
+        self.assertEqual(overlay.phase, "visible")
         overlay.toggle()
         self.assertEqual(overlay.phase, "closing")
         self.assertTrue(overlay.cancelled.is_set())
-        # A second toggle during close records intent; it does not race a new mapping.
         overlay.toggle()
         self.assertTrue(overlay.desired)
         self.assertEqual(overlay.phase, "closing")
-        old_capture, old_callback = jobs.pop(0)
-        old_callback(True, niri.overlay_context(controller.backend.data))
         finish, finish_callback = jobs.pop(0)
         finish()
         finish_callback(True, None)
-        self.assertEqual(overlay.phase, "capturing")
+        self.assertEqual(overlay.phase, "visible")
         self.assertTrue(overlay.desired)
-        self.assertEqual(len(jobs), 1)
+        self.assertEqual(len(jobs), 0)
         overlay.dismiss()
-        jobs.pop(0)[1](True, None)
+        finish, finish_callback = jobs.pop(0)
+        finish()
+        finish_callback(True, None)
         overlay.close()
 
     def test_escape_hides_visible_overlay_and_restores_original_focus(self):
         controller, overlay, jobs = self.make_window()
         overlay.toggle()
-        capture, callback = jobs.pop(0)
-        callback(True, niri.overlay_context(controller.backend.data))
         self.assertEqual(overlay.phase, "visible")
         overlay.view.escape_pressed.emit()
         self.assertEqual(overlay.phase, "closing")
@@ -135,7 +187,6 @@ class OverlayTests(unittest.TestCase):
         controller, overlay, jobs = self.make_window()
         selected = controller.backend.data["windows"][1]["id"]
         overlay.toggle()
-        jobs.pop(0)[1](True, niri.overlay_context(controller.backend.data))
         overlay.command("focus", selected)
         self.assertEqual(overlay.phase, "closing")
         self.assertEqual(len(jobs), 1)
@@ -143,6 +194,65 @@ class OverlayTests(unittest.TestCase):
         job()
         self.assertFalse(overlay.isVisible())
         callback(True, None)
+
+    def test_numeric_hint_uses_mouse_focus_dismissal_path(self):
+        controller, overlay, jobs = self.make_window()
+        selected = controller.backend.data["windows"][1]["id"]
+        overlay.toggle()
+        hint = str(overlay.view.hint_assignments.by_window[selected])
+        QTest.keyClicks(overlay.view, hint)
+        self.assertEqual(overlay.phase, "closing")
+        finish, callback = jobs.pop(0)
+        finish()
+        self.assertEqual(controller.backend.data["windows"][1]["is_focused"], True)
+        callback(True, None)
+        self.assertEqual(overlay.phase, "hidden")
+        self.assertFalse(overlay.isVisible())
+
+    def test_keyboard_selection_works_at_every_opacity(self):
+        for opacity in (1.0, 0.8, 0.0):
+            for count, hint in ((3, "2"), (12, "10")):
+                with self.subTest(opacity=opacity, count=count):
+                    controller, overlay, jobs = self.make_window(opacity)
+                    template = controller.backend.data["windows"][0]
+                    controller.backend.data["windows"] = [dict(template, id=100 + i, is_focused=(i == 0))
+                                                          for i in range(count)]
+                    controller.receive_state(controller.backend.data)
+                    overlay.toggle()
+                    selected = overlay.view.hint_targets[hint]
+                    QTest.keyClicks(overlay.view, hint[0])
+                    if len(hint) > 1:
+                        self.assertEqual(overlay.phase, "visible")
+                        self.assertEqual(overlay.numeric.pending, "1")
+                        QTest.keyClicks(overlay.view, hint[1:])
+                    self.assertEqual(overlay.phase, "closing")
+                    finish, callback = jobs.pop(0)
+                    finish()
+                    callback(True, None)
+                    self.assertEqual(overlay.phase, "hidden")
+                    focused = next(w for w in controller.backend.data["windows"] if w["is_focused"])
+                    self.assertEqual(focused["id"], selected)
+                    self.assertFalse(overlay.numeric.timer.isActive())
+                    overlay.deleteLater()
+
+    def test_toggle_cancels_pending_numeric_sequence(self):
+        controller, overlay, jobs = self.make_window()
+        overlay.toggle()
+        overlay.numeric.update({1: 1, 10: 10})
+        QTest.keyClicks(overlay.view, "1")
+        self.assertTrue(overlay.numeric.timer.isActive())
+        overlay.toggle()
+        self.assertEqual(overlay.numeric.pending, "")
+        self.assertFalse(overlay.numeric.timer.isActive())
+        overlay.deleteLater()
+
+    def test_persistent_view_does_not_handle_numeric_selection(self):
+        dashboard = Dashboard(demo=True, start_backend=False)
+        pressed = []
+        dashboard.view.numeric_pressed.connect(pressed.append)
+        QTest.keyClicks(dashboard.view, "12")
+        self.assertEqual(pressed, [])
+        dashboard.close()
 
     def test_controller_uses_one_worker_for_both_presentations(self):
         controller = DashboardController(demo=True, start_backend=False)
@@ -155,15 +265,35 @@ class OverlayTests(unittest.TestCase):
         dashboard.close()
         overlay.close()
 
+    def test_overlay_targets_dp3_but_retains_previous_window_for_restoration(self):
+        state = demo_state()
+        original = niri.overlay_context(state)
+        state["outputs"]["DP-3"] = dict(state["outputs"][original["output"]])
+        state["workspaces"].append({"id": 999, "idx": 1, "output": "DP-3",
+                                    "is_active": True, "is_focused": False})
+        context = niri.overlay_context(state, target_output="DP-3")
+        self.assertEqual(context["output"], "DP-3")
+        self.assertEqual(context["workspace_id"], 999)
+        self.assertEqual(context["window_id"], original["window_id"])
+        with self.assertRaisesRegex(RuntimeError, "not available"):
+            niri.overlay_context(state, target_output="missing")
+
     def test_place_checks_float_rule_then_targets_only_overlay_id(self):
         state = demo_state()
         context = niri.overlay_context(state)
+        context["overlay_size"] = (900, 500)
         overlay = {"id": 99, "app_id": niri.APP_ID, "title": niri.OVERLAY_TITLE,
                    "pid": os.getpid(), "workspace_id": context["workspace_id"], "is_floating": True}
         with patch.object(niri, "get_windows", return_value=[overlay]), patch.object(niri, "get_workspaces", return_value=state["workspaces"]), patch.object(niri, "action") as action:
             niri.place_overlay(99, context, threading.Event(), os.getpid())
         self.assertEqual([call.args[0] for call in action.call_args_list], ["SetWindowWidth", "SetWindowHeight", "MoveFloatingWindow", "FocusWindow"])
         self.assertTrue(all(call.kwargs.get("id") == 99 for call in action.call_args_list))
+
+        self.assertEqual(action.call_args_list[0].kwargs["change"], {"SetFixed": 900})
+        self.assertEqual(action.call_args_list[1].kwargs["change"], {"SetFixed": 500})
+        placement = action.call_args_list[2].kwargs
+        self.assertEqual(placement["x"], {"SetFixed": round((context["logical"]["width"] - 900) / 2)})
+        self.assertEqual(placement["y"], {"SetFixed": round((context["logical"]["height"] - 500) / 2)})
 
     def test_place_fails_safely_without_rule(self):
         state = demo_state()

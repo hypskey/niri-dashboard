@@ -50,11 +50,12 @@ def run_gui(args):
         # Finish overlay restoration in the same queue before requesting stop.
         controller.task(lambda: None, lambda ok, result: controller.stop())
 
-    def handle(command):
+    def handle(command, ipc_latency_ms=0):
         if command == "status":
             return {"pid": __import__("os").getpid(), "connected": controller.connected,
                     "overlay": overlay.phase, "overlay_window_id": overlay.window_id,
                     "output": (overlay.context or {}).get("output"), "last_open_ms": overlay.last_open_ms,
+                    "timings_ms": dict(overlay.timings_ms),
                     "error": overlay.failure, "polling_workers": int(controller.backend.isRunning())}
         if command == "quit":
             QTimer.singleShot(0, shutdown)
@@ -63,7 +64,7 @@ def run_gui(args):
             raise RuntimeError("NiriDashboard is stopping.")
         if not controller.connected:
             raise RuntimeError(controller.health_message)
-        return {"accepted": True, "overlay": overlay.toggle()}
+        return {"accepted": True, "overlay": overlay.toggle(ipc_latency_ms)}
 
     # Acquire session ownership before starting any Niri polling.
     server = create_server(path, handle)

@@ -2,6 +2,7 @@
 import json
 import os
 import socket
+import time
 
 
 def run_niri_ipc(request):
@@ -128,7 +129,7 @@ def is_overlay(window):
     return window.get("app_id") == APP_ID and window.get("title") == OVERLAY_TITLE
 
 
-def overlay_context(data, focused_output=None):
+def overlay_context(data, focused_output=None, target_output=None):
     """Read-only selection, including focused empty workspaces."""
     focused = next((w for w in data["windows"] if w.get("is_focused") and not is_overlay(w)), None)
     workspace = next((w for w in data["workspaces"] if w.get("is_focused")), None)
@@ -138,6 +139,11 @@ def overlay_context(data, focused_output=None):
         workspace = next((w for w in data["workspaces"] if w.get("is_active") and w.get("output") == focused_output), None)
     if workspace is None:
         raise RuntimeError("Could not determine the focused workspace.")
+    if target_output is not None:
+        workspace = next((w for w in data["workspaces"]
+                          if w.get("is_active") and w.get("output") == target_output), None)
+        if workspace is None:
+            raise RuntimeError(f"Overlay display {target_output} is not available.")
     output = workspace.get("output")
     logical = data["outputs"].get(output, {}).get("logical")
     if not logical:
@@ -146,17 +152,18 @@ def overlay_context(data, focused_output=None):
             "output": output, "logical": logical}
 
 
-def capture_overlay_context():
+def capture_overlay_context(target_output=None):
     data = snapshot()
     try:
-        return overlay_context(data)
+        return overlay_context(data, target_output=target_output)
     except RuntimeError:
         output = run_niri_ipc("FocusedOutput")["FocusedOutput"]
-        return overlay_context(data, output.get("name") if output else None)
+        return overlay_context(data, output.get("name") if output else None, target_output=target_output)
 
 
 def place_overlay(window_id, context, cancelled, pid):
     """Only the owned overlay may be positioned; existing windows are untouched."""
+    started = time.perf_counter()
     def perform(name, **fields):
         if cancelled.is_set():
             return False
@@ -177,13 +184,16 @@ def place_overlay(window_id, context, cancelled, pid):
     if window.get("workspace_id") != workspace["id"]:
         perform("MoveWindowToWorkspace", window_id=window_id, reference={"Id": workspace["id"]}, focus=False)
     logical = context["logical"]
-    width, height = round(logical["width"] * .9), round(logical["height"] * .9)
+    width, height = context.get("overlay_size", (round(logical["width"] * .9), round(logical["height"] * .9)))
     perform("SetWindowWidth", id=window_id, change={"SetFixed": width})
     perform("SetWindowHeight", id=window_id, change={"SetFixed": height})
     perform("MoveFloatingWindow", id=window_id,
-            x={"SetFixed": round(logical["width"] * .05)},
-            y={"SetFixed": round(logical["height"] * .05)})
+            x={"SetFixed": round((logical["width"] - width) / 2)},
+            y={"SetFixed": round((logical["height"] - height) / 2)})
+    focus_started = time.perf_counter()
     perform("FocusWindow", id=window_id)
+    return {"placement": round((focus_started - started) * 1000, 3),
+            "focus": round((time.perf_counter() - focus_started) * 1000, 3)}
 
 
 def restore_overlay_focus(context, restore=True):

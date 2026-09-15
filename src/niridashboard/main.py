@@ -17,14 +17,15 @@ from PySide6.QtWidgets import QHBoxLayout, QLabel, QMainWindow, QVBoxLayout, QWi
 from niridashboard.controller import DashboardController
 from niridashboard.graph import GraphView
 
-STYLE = """
-QMainWindow, QWidget { background: #f5f2ed; color: #434853; font-family: 'Sans Serif'; }
-QLabel#muted { color: #737681; }
-QLabel#error { color: #8c4a4a; background: #f1deda; padding: 10px; border-radius: 6px; }
-QScrollBar:horizontal { height: 9px; background: #f5f2ed; }
-QScrollBar:vertical { width: 9px; background: #f5f2ed; }
-QScrollBar::handle { background: #d2ccc4; border-radius: 4px; min-width: 24px; min-height: 24px; }
-QScrollBar::add-line, QScrollBar::sub-line { width: 0; height: 0; }
+def dashboard_style(palette, settings):
+    return f"""
+QMainWindow, QWidget {{ background: {palette.dashboard_background}; color: {palette.primary_text}; font-family: '{settings.font_family}'; }}
+QLabel#muted {{ color: {palette.secondary_text}; }}
+QLabel#error {{ color: {palette.error_text}; background: {palette.error_background}; padding: 10px; border-radius: 6px; }}
+QScrollBar:horizontal {{ height: 9px; background: {palette.dashboard_background}; }}
+QScrollBar:vertical {{ width: 9px; background: {palette.dashboard_background}; }}
+QScrollBar::handle {{ background: {palette.node_border}; border-radius: 4px; min-width: 24px; min-height: 24px; }}
+QScrollBar::add-line, QScrollBar::sub-line {{ width: 0; height: 0; }}
 """
 
 
@@ -34,7 +35,7 @@ class GraphWindow(QMainWindow):
         super().__init__()
         self.controller = controller
         self.backend = controller.backend  # Compatibility for callers inspecting the worker.
-        self.view = GraphView(controller.icons, translucent=translucent)
+        self.view = GraphView(controller.icons, translucent=translucent, appearance=controller.appearance)
         self.pending = None
         self.last_state = None
         self.error_kind = None
@@ -42,6 +43,10 @@ class GraphWindow(QMainWindow):
         self.view.focus_requested.connect(lambda wid: self.command("focus", wid))
         self.view.close_requested.connect(lambda wid: self.command("close", wid))
         self.view.interaction_finished.connect(self.apply_pending)
+        controller.appearance_changed.connect(self.receive_appearance)
+
+    def receive_appearance(self):
+        self.view.set_appearance()
 
     def command(self, kind, *args):
         self.controller.action(self, kind, *args)
@@ -81,8 +86,11 @@ class GraphWindow(QMainWindow):
     def apply_pending(self):
         if self.pending is None or self.view.interacting or self.view.busy:
             return
-        self.last_state, self.pending = self.pending, None
-        self.view.render(self.last_state)
+        state, self.pending = self.pending, None
+        if state == self.last_state:
+            return
+        self.last_state = state
+        self.view.render(state)
 
 
 class Dashboard(GraphWindow):
@@ -93,18 +101,20 @@ class Dashboard(GraphWindow):
         self.setWindowTitle("Niri Dashboard")
         self.resize(1440, 900)
         self.setMinimumSize(760, 480)
-        self.setStyleSheet(STYLE)
+        palette = controller.appearance.palette
+        settings = controller.appearance.settings
+        self.setStyleSheet(dashboard_style(palette, settings))
         root = QWidget()
         layout = QVBoxLayout(root)
         layout.setContentsMargins(24, 20, 24, 12)
         layout.setSpacing(12)
         header = QHBoxLayout()
         title = QLabel("NIRI  /  DASHBOARD")
-        title.setStyleSheet("font-size: 19px; font-weight: 700; letter-spacing: 2px;")
+        title.setStyleSheet(f"font-size: {settings.normal_text_size * 2}px; font-weight: 700; letter-spacing: 2px;")
         header.addWidget(title)
-        badge = QLabel("ALPHA" + (" · DEMO" if demo else ""))
-        badge.setStyleSheet("color: #52796b; padding: 5px 9px; background: #e1ece4; border-radius: 5px;")
-        header.addWidget(badge)
+        self.badge = QLabel("ALPHA" + (" · DEMO" if demo else ""))
+        self.badge.setStyleSheet(f"color: {palette.focused_text}; padding: 5px 9px; background: {palette.focused_background}; border-radius: 5px;")
+        header.addWidget(self.badge)
         header.addStretch()
         layout.addLayout(header)
         self.summary = QLabel("Connecting to your desktop…")
@@ -118,7 +128,7 @@ class Dashboard(GraphWindow):
         layout.addWidget(self.view, 1)
         footer = QHBoxLayout()
         self.status = QLabel("Starting…")
-        self.status.setStyleSheet("color: #52796b;")
+        self.status.setStyleSheet(f"color: {palette.output_label};")
         footer.addWidget(self.status)
         footer.addStretch()
         self.help = QLabel("Drag to move · Click to focus · Wheel to zoom · Drag background to pan")
@@ -162,6 +172,14 @@ class Dashboard(GraphWindow):
             data = self.last_state
             count = sum(bool(o.get("logical")) for o in data["outputs"].values())
             self.summary.setText(f"{count} monitors   /   {len(data['workspaces'])} workspaces   /   {len(data['windows'])} windows     ·     Your entire desktop, connected")
+
+    def receive_appearance(self):
+        super().receive_appearance()
+        palette = self.controller.appearance.palette
+        settings = self.controller.appearance.settings
+        self.setStyleSheet(dashboard_style(palette, settings))
+        self.badge.setStyleSheet(f"color: {palette.focused_text}; padding: 5px 9px; background: {palette.focused_background}; border-radius: 5px;")
+        self.status.setStyleSheet(f"color: {palette.output_label};")
 
     def closeEvent(self, event):
         self.view.cancel_drag()

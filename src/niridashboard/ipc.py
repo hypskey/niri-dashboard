@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import socket
 import stat
+import time
 
 MAX_REQUEST = 1024
 
@@ -26,21 +27,30 @@ def socket_path(demo=False):
 
 
 def send_command(command, path, timeout=2):
-    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
-        connection.settimeout(timeout)
-        try:
-            connection.connect(path)
-        except (FileNotFoundError, ConnectionRefusedError) as error:
-            raise RuntimeError("NiriDashboard is not running. Start: bin/niridashboard serve --dashboard") from error
-        connection.sendall(json.dumps({"command": command}).encode() + b"\n")
-        with connection.makefile("rb") as stream:
-            reply = stream.readline(4096)
-        if not reply.endswith(b"\n"):
-            raise RuntimeError("Incomplete reply from NiriDashboard.")
-        result = json.loads(reply)
-        if not result.get("ok"):
-            raise RuntimeError(result.get("error", "Command rejected"))
-        return result["result"]
+    def exchange(request):
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+            connection.settimeout(timeout)
+            try:
+                connection.connect(path)
+            except (FileNotFoundError, ConnectionRefusedError) as error:
+                raise RuntimeError("NiriDashboard is not running. Start: bin/niridashboard serve --dashboard") from error
+            connection.sendall(json.dumps(request).encode() + b"\n")
+            with connection.makefile("rb") as stream:
+                reply = stream.readline(4096)
+            if not reply.endswith(b"\n"):
+                raise RuntimeError("Incomplete reply from NiriDashboard.")
+            result = json.loads(reply)
+            if not result.get("ok"):
+                raise RuntimeError(result.get("error", "Command rejected"))
+            return result["result"]
+
+    try:
+        return exchange({"command": command, "sent_ns": time.monotonic_ns()})
+    except RuntimeError as error:
+        # Let a resident started by an older version continue to handle toggles.
+        if str(error) != "Unknown command":
+            raise
+        return exchange({"command": command})
 
 
 def create_server(path, handler):
@@ -99,9 +109,14 @@ def create_server(path, handler):
                 if len(buffer) > MAX_REQUEST:
                     raise ValueError("Request too large")
                 request = json.loads(buffer)
-                if not isinstance(request, dict) or set(request) != {"command"} or request["command"] not in ("toggle-overlay", "quit", "status"):
+                if (not isinstance(request, dict) or set(request) not in ({"command"}, {"command", "sent_ns"})
+                        or request.get("command") not in ("toggle-overlay", "quit", "status")):
                     raise ValueError("Unknown command")
-                result = {"ok": True, "result": handler(request["command"])}
+                sent_ns = request.get("sent_ns")
+                if sent_ns is not None and (isinstance(sent_ns, bool) or not isinstance(sent_ns, int) or sent_ns < 0):
+                    raise ValueError("Invalid request timestamp")
+                latency_ms = max(0.0, (time.monotonic_ns() - sent_ns) / 1_000_000) if sent_ns is not None else 0.0
+                result = {"ok": True, "result": handler(request["command"], latency_ms)}
             except Exception as error:
                 result = {"ok": False, "error": str(error)}
             peer.write(json.dumps(result).encode() + b"\n")

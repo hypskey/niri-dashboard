@@ -258,6 +258,13 @@ class GraphTests(unittest.TestCase):
         self.dashboard.receive_state(data)
         self.assertEqual(len(self.view.rows), 9)
 
+    def test_workspace_labels_are_numbers_and_output_names_remain_visible(self):
+        labels = [item.text() for item in self.view.scene().items()
+                  if hasattr(item, "text")]
+        self.assertIn("01  /  DP-1", labels)
+        self.assertNotIn("Workspace 01", labels)
+        self.assertNotIn("main", labels)
+
     def test_disconnected_cannot_issue_action(self):
         self.dashboard.receive_health(False, "Socket lost")
         QTest.mouseClick(self.view.viewport(), Qt.MouseButton.LeftButton, pos=self.center(1))

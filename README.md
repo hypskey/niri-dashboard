@@ -4,7 +4,8 @@ A mouse-operated graph of the live Niri desktop. Monitor branches contain
 vertical workspace rows and horizontal app nodes. The persistent dashboard and
 the temporary Quick Overlay share one Niri model, controller, action worker,
 icons, and graph implementation. The overlay is a normal floating Qt window;
-its canvas is transparent so the desktop remains visible behind the graph.
+its canvas uses the same solid Noctalia background as the main dashboard, sized
+around the graph with a desktop margin.
 
 ## Install and run
 
@@ -43,11 +44,65 @@ bin/niridashboard quit
 ```
 
 The shortcut command is a small local IPC client; it does not start another Qt
-application or polling worker. NiriDashboard captures the focused output and
-workspace, maps and sizes the overlay on that output, and fits the complete
+application or polling worker. NiriDashboard uses the active workspace on DP-3, retains the previously focused
+window for restoration, and fits the complete
 desktop graph. Use the same shortcut or Escape to hide it. Selecting an app
 focuses that app and hides the overlay. A right-click on an app requests its
 normal close action.
+
+Every open app has a numbered hint. Type the number while the overlay is
+focused to select it; ambiguous prefixes wait briefly (for example, `1` waits
+when `10` is also present). Escape clears a pending number first, and a second
+Escape closes the overlay.
+
+## Appearance and settings
+
+Colors come from `~/.config/gtk-4.0/noctalia.css` (`@define-color` values).
+The file is watched and palette updates apply without restarting the app. The
+persistent dashboard uses Noctalia's window background; the overlay canvas
+uses the same solid background as the main dashboard. Missing or invalid
+colors use built-in fallback colors.
+
+Non-color settings are read once at startup from
+`~/.config/niridashboard/config.toml`. Missing or invalid entries use defaults:
+
+```toml
+[font]
+family = "Sans Serif"
+normal_text_size = 10
+output_label_size = 15
+workspace_number_size = 11
+application_title_size = 9
+window_title_size = 8
+hint_badge_font_size = 9
+
+[graph]
+icon_size = 38
+node_width = 108
+node_height = 100
+workspace_step = 136
+workspace_row = 144
+branch_gap = 60
+graph_padding = 32
+
+[overlay]
+opacity = 1.0
+max_width_percent = 86
+max_height_percent = 86
+min_width = 360
+min_height = 220
+```
+
+`opacity` controls only the overlay background: `0.0` is fully transparent,
+`1.0` is solid (default), and `0.8` is 80% opaque. Nodes, icons, connections, and
+text remain opaque. The color continues to follow Noctalia.
+
+Overlay limits are percentages of the focused monitor (10–100); minimum sizes
+are logical pixels (width: 200–7680, height: 150–4320). The overlay still fits the
+graph automatically within these limits. Lower the percentages for a smaller
+overlay; raise the minimum sizes to give a small graph a larger window. Maximum
+limits take precedence over configured minimums, subject to Qt's 200 × 150 minimum.
+Invalid values use the defaults above. Restart the resident dashboard after editing.
 
 ## Interacting with the graph
 
@@ -87,13 +142,18 @@ reports the error and refreshes from actual desktop state. No undo yet.
 - `ipc.py` and `cli.py`: resident control socket and launch/toggle/status/quit
   commands.
 - `icons.py`: cached icon lookup with fallback artwork.
+- `appearance.py`: Noctalia palette parsing/watching and validated TOML settings.
+- `hints.py`: stable app-number assignments and multi-digit prefix selection.
 - `bin/niridashboard`: launch wrapper using `.venv` when present.
 - `tests/`: offscreen behavior, overlay, paint, and Niri action regressions.
 
 Snapshots poll every 150 ms after the previous request finishes. All Niri I/O
 runs on the worker thread; unchanged snapshots do not redraw, and state updates
-wait while a drag or action is in progress. Overlay windows are excluded by
-their app ID and exact title before the graph is rendered.
+wait while a drag or action is in progress. A warm overlay opens immediately
+from the latest cached snapshot and reconciles with the next worker snapshot.
+`niridashboard status` reports the latest activation-stage timings. Overlay
+windows are excluded by their app ID and exact title before the graph is
+rendered.
 
 ## Tests
 
@@ -104,3 +164,10 @@ niri validate -c examples/overlay.kdl
 
 `tests/live_smoke.py` is an optional real-compositor check using temporary test
 windows and empty workspaces; it restores the original focus when complete.
+
+For URL-based website icons in Zen/Firefox (including ChatGPT conversation titles),
+see the optional [local active-tab extension setup](browser-extension/README.md).
+Without it, existing title-based icons continue to work.
+
+The quick overlay currently targets DP-3 and applies a 20% enlargement after its
+existing sizing calculation, capped at 96% of the display to keep it on-screen.
