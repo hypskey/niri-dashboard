@@ -246,10 +246,10 @@ class OverlayWindow(GraphWindow):
         if self.last_open_ms is None:
             self.last_open_ms = round((time.monotonic() - self.opened_at) * 1000, 1)
             self.timings_ms["visible_from_toggle"] = self.last_open_ms
-        generation, context, cancelled, wid = self.generation, self.context, self.cancelled, self.window_id
-        def place():
-            return niri.place_overlay(wid, context, cancelled, os.getpid())
-        self.controller.task(place, lambda ok, value: self.placed(generation, ok, value))
+        generation = self.generation
+
+        # TEMP TEST: do not reposition the overlay after Niri maps it.
+        self.placed(generation, True, {"placement": 0, "focus": 0})
 
     def placed(self, generation, success, value):
         if generation != self.generation or self.phase not in ("mapping", "visible") or not self.desired:
