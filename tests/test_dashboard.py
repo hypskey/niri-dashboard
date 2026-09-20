@@ -3,9 +3,9 @@ import os
 import unittest
 from unittest.mock import patch
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-from PySide6.QtCore import QPoint, QPointF, Qt
+from PySide6.QtCore import QPoint, QPointF, QRectF, Qt
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QGraphicsLineItem
 from niridashboard import niri
 from niridashboard.backend import Backend, demo_state
 from niridashboard.main import Dashboard
@@ -176,6 +176,44 @@ class GraphTests(unittest.TestCase):
         self.assertEqual(self.focuses, [1])
         self.assertEqual(self.moves, [])
 
+    def test_focused_window_draws_one_accent_route_over_neutral_pipes(self):
+        state = demo_state()
+        target = next(window for window in state["windows"] if window["workspace_id"] == 4 and window["layout"]["pos_in_scrolling_layout"][0] == 2)
+        for window in state["windows"]:
+            window["is_focused"] = window["id"] == target["id"]
+        self.dashboard.receive_state(state)
+        accent = self.view.colors.focused_route.lower()
+        neutral = self.view.colors.neutral_pipe.lower()
+        lines = [item for item in self.view.scene().items()
+                 if isinstance(item, QGraphicsLineItem) and item.parentItem() is None]
+        accent_lines = [item for item in lines if item.pen().color().name().lower() == accent and item.pen().widthF() == 4]
+        normal_lines = [item for item in lines if item.pen().widthF() in (2, 3)]
+        self.assertEqual(len(accent_lines), 3)  # trunk, branch, and the segment before app two
+        self.assertTrue(normal_lines)
+        self.assertTrue(all(item.pen().color().name().lower() == neutral for item in normal_lines))
+        del lines, accent_lines, normal_lines
+
+        refreshed = demo_state()
+        self.dashboard.receive_state(refreshed)
+        lines = [item for item in self.view.scene().items()
+                 if isinstance(item, QGraphicsLineItem) and item.parentItem() is None]
+        accent_lines = [item for item in lines if item.pen().color().name().lower() == accent and item.pen().widthF() == 4]
+        self.assertEqual(len(accent_lines), 2)  # focus returned to the first window in the first workspace
+        del lines, accent_lines
+
+        second_workspace = demo_state()
+        target = next(window for window in second_workspace["windows"] if window["workspace_id"] == 5)
+        for window in second_workspace["windows"]:
+            window["is_focused"] = window["id"] == target["id"]
+        self.dashboard.receive_state(second_workspace)
+        lines = [item for item in self.view.scene().items()
+                 if isinstance(item, QGraphicsLineItem) and item.parentItem() is None]
+        trunk = next(item.line() for item in lines
+                     if item.pen().color().name().lower() == accent and item.pen().widthF() == 4
+                     and item.line().x1() == item.line().x2())
+        self.assertGreater(trunk.y2(), trunk.y1())
+        self.assertGreater(trunk.y2(), 141)  # route reaches the second workspace junction
+
     def test_right_click_closes_target_without_focusing(self):
         QTest.mouseClick(self.view.viewport(), Qt.MouseButton.RightButton, pos=self.center(2))
         self.assertEqual(self.dashboard.backend.commands.get_nowait(), ("close", 2))
@@ -256,7 +294,54 @@ class GraphTests(unittest.TestCase):
         data = demo_state()
         data["outputs"] = {}
         self.dashboard.receive_state(data)
-        self.assertEqual(len(self.view.rows), 9)
+        self.assertEqual(len(self.view.rows), 7)
+
+    def test_hides_only_trailing_empty_workspaces_and_keeps_one_on_idle_output(self):
+        self.assertEqual([row["workspace"]["id"] for row in self.view.rows], [1, 2, 4, 5, 7, 8, 9])
+        state = demo_state()
+        state["windows"] = [window for window in state["windows"] if window["workspace_id"] != 1]
+        self.dashboard.receive_state(state)
+        self.assertIn(1, [row["workspace"]["id"] for row in self.view.rows])
+
+    def test_drag_below_visible_rows_targets_real_hidden_trailing_workspace(self):
+        target = next(target for target in self.view.trailing_targets if target["workspace"]["id"] == 3)
+        self.view.pressed = self.view.nodes[1]
+        self.view.origin = QPointF(self.view.pressed.pos())
+        self.view.offset = QPointF()
+        self.view.dragging = True
+        self.view.update_drag(self.view.mapFromScene(target["rect"].center()))
+        self.assertEqual(self.view.drop, (3, None))
+        self.assertIsNotNone(self.view.marker)
+        self.assertIn("create workspace", self.help_text())
+        self.view.cancel_drag()
+        self.assertIsNone(self.view.drop)
+        self.assertIsNone(self.view.marker)
+
+    def test_dragging_to_hidden_workspace_target_keeps_view_transform_stable(self):
+        target = next(target for target in self.view.trailing_targets if target["workspace"]["id"] == 3)
+        self.view.fit_graph()
+        initial_scale = self.view.transform().m11()
+        initial_rect = QRectF(self.view.sceneRect())
+        self.view.pressed = self.view.nodes[1]
+        self.view.origin = QPointF(self.view.pressed.pos())
+        self.view.offset = QPointF()
+        self.view.dragging = True
+        self.view.drag_scene_rect = QRectF(self.view.sceneRect())
+        self.view.drag_transform = self.view.transform()
+
+        self.view.update_drag(self.view.mapFromScene(target["rect"].center()))
+        self.view.fit_graph()
+        self.view.resize(self.view.width() - 17, self.view.height() - 13)
+        self.app.processEvents()
+
+        self.assertAlmostEqual(self.view.transform().m11(), initial_scale)
+        self.assertIsNotNone(self.view.marker)
+        self.view.cancel_drag()
+        self.assertEqual(self.view.sceneRect(), initial_rect)
+        self.assertAlmostEqual(self.view.transform().m11(), initial_scale)
+
+    def help_text(self):
+        return self.dashboard.help.text()
 
     def test_workspace_labels_are_numbers_and_output_names_remain_visible(self):
         labels = [item.text() for item in self.view.scene().items()

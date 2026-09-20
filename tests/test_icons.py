@@ -36,7 +36,7 @@ class IconTests(unittest.TestCase):
             _ICON_ASSET_CACHE.clear()
             self.assertEqual(icons._theme_icon_path("raster", 38), str(large / "raster.png"))
 
-    def test_rendered_pixmap_cache_preserves_wide_icon_ratio(self):
+    def test_rendered_pixmap_cache_centers_wide_artwork_in_a_square_slot(self):
         with tempfile.TemporaryDirectory() as directory:
             image = QImage(128, 64, QImage.Format.Format_ARGB32)
             image.fill(0xFF336699)
@@ -45,7 +45,8 @@ class IconTests(unittest.TestCase):
             icons = Icons()
             icons.entries["wide-app"] = ("Wide App", str(icon_path))
             pixmap = icons.rendered("wide-app", 38)
-            self.assertEqual((pixmap.width(), pixmap.height()), (38, 19))
+            self.assertEqual((pixmap.width(), pixmap.height()), (152, 152))
+            self.assertEqual(pixmap.devicePixelRatio(), 4)
             self.assertIs(icons.rendered("wide-app", 38), pixmap)
 
     def test_recognizes_requested_sites_from_tab_titles(self):

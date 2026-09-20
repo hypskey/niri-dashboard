@@ -1,4 +1,4 @@
-"""Stable per-view numeric hints and an ambiguous-prefix selection state machine."""
+"""Stable shared numeric hints and an ambiguous-prefix selection state machine."""
 from PySide6.QtCore import QObject, QTimer, Signal
 
 

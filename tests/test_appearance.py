@@ -22,6 +22,7 @@ class AppearanceTests(unittest.TestCase):
             @define-color accent_fg_color #101112;
             @define-color window_bg_color #101010;
             @define-color window_fg_color #f0f0f0;
+            @define-color theme_unfocused_fg_color #dddddd;
             @define-color theme_selected_bg_color @accent_bg_color;
             @define-color theme_selected_fg_color @accent_fg_color;
             @define-color card_bg_color #141414;
@@ -32,6 +33,8 @@ class AppearanceTests(unittest.TestCase):
         self.assertEqual(palette.focused_background, "#abcdef")
         self.assertEqual(palette.node_background, "#141414")
         self.assertEqual(palette.pipe_colors[1], "#00ff00")
+        self.assertEqual(palette.focused_route, "#abcdef")
+        self.assertEqual(palette.neutral_pipe, "#8f8f8f")
 
     def test_invalid_theme_uses_safe_defaults(self):
         self.assertEqual(parse_noctalia_css("not valid css"), DEFAULT_PALETTE)
@@ -68,6 +71,15 @@ class AppearanceTests(unittest.TestCase):
                 with self.subTest(value=value):
                     path.write_text(f"[overlay]\nopacity = {value}\n")
                     self.assertEqual(DashboardSettings.load(path).overlay_opacity, expected)
+
+    def test_main_background_opacity_clamps_to_transparent_range(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.toml"
+            for value, expected in [("0", 0.0), ("0.65", .65), ("1", 1.0),
+                                    ("-0.1", 0.0), ("1.1", 1.0), ("true", 1.0), ('"0.8"', 1.0)]:
+                with self.subTest(value=value):
+                    path.write_text(f"[appearance]\nbackground_opacity = {value}\n")
+                    self.assertEqual(DashboardSettings.load(path).background_opacity, expected)
 
     def test_malformed_or_missing_config_uses_defaults(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -6,6 +6,8 @@ import re
 from .browser_bridge import site_for_hostname
 from PySide6.QtCore import Qt, QRectF, QSize
 from PySide6.QtGui import QColor, QFont, QIcon, QImageReader, QPainter, QPixmap
+from .appearance import DEFAULT_PALETTE
+from .icon_catalog import DEFAULT_CATALOG
 
 _THEME_DIRECTORY_CACHE = None
 _ICON_ASSET_CACHE = {}
@@ -50,6 +52,8 @@ class Icons:
         self.cache = {}
         self.pixmaps = {}
         self.site_icons = {}
+        self.catalog_icons = {}
+        self.catalog_asset_versions = {}
         self.fallback_apps = set()
         self.theme_directories = None
         seen = set()
@@ -150,6 +154,8 @@ class Icons:
     def refresh_theme(self):
         self.pixmaps.clear()
         self.site_icons.clear()
+        self.catalog_icons.clear()
+        self.catalog_asset_versions.clear()
         for app_id in self.fallback_apps:
             self.cache.pop(app_id, None)
         self.fallback_apps.clear()
@@ -198,31 +204,121 @@ class Icons:
             self.site_icons[site] = icon
         return self.site_icons[site]
 
-    def resolve_for_window(self, app_id, title, hostname=None):
+    def catalog_icon(self, icon_id):
+        """Return bundled catalog artwork before considering an icon-theme fallback."""
+        entry = DEFAULT_CATALOG.get(icon_id)
+        if entry is None:
+            return None
+        version = None
+        if entry.asset_path and entry.asset_path.is_file():
+            try:
+                details = entry.asset_path.stat()
+                version = details.st_mtime_ns, details.st_size
+            except OSError:
+                pass
+        if icon_id in self.catalog_icons and self.catalog_asset_versions.get(icon_id) == version:
+            return self.catalog_icons[icon_id]
+        self.catalog_icons.pop(icon_id, None)
+        self.catalog_asset_versions[icon_id] = version
+        # A manual asset can be replaced while the dashboard is running. Drop
+        # only the corresponding rendered card cache so it is not kept stale.
+        self.pixmaps = {key: value for key, value in self.pixmaps.items() if key[2] != icon_id}
+        target = self.appearance.settings.icon_size if self.appearance else 38
+        icon = None
+        if entry.asset_path and entry.asset_path.is_file():
+            icon = QIcon(str(entry.asset_path))
+        for name in entry.icon_names:
+            if icon is not None:
+                break
+            path = self._theme_icon_path(name, target)
+            candidate = QIcon(path) if path else QIcon.fromTheme(name)
+            if not candidate.isNull():
+                icon = candidate
+                break
+        if icon is None:
+            # A compact local fallback keeps every catalog item usable even when
+            # the selected icon theme does not provide a brand logo.
+            palette = self.appearance.palette if self.appearance else DEFAULT_PALETTE
+            pixmap = QPixmap(128, 128)
+            pixmap.fill(Qt.GlobalColor.transparent)
+            painter = QPainter(pixmap)
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+            painter.setBrush(QColor(palette.focused_background))
+            painter.setPen(QColor(palette.focused_border))
+            painter.drawEllipse(QRectF(4, 4, 120, 120))
+            painter.setPen(QColor(palette.focused_text))
+            family = self.appearance.settings.font_family if self.appearance else "Sans Serif"
+            painter.setFont(QFont(family, 42, QFont.Weight.Bold))
+            painter.drawText(QRectF(0, 0, 128, 128), Qt.AlignmentFlag.AlignCenter, entry.name[0])
+            painter.end()
+            icon = QIcon(pixmap)
+        self.catalog_icons[icon_id] = icon
+        return icon
+
+    @staticmethod
+    def _opaque_bounds(image):
+        """Return the smallest rectangle containing non-transparent pixels."""
+        left, top = image.width(), image.height()
+        right = bottom = -1
+        for y in range(image.height()):
+            for x in range(image.width()):
+                if image.pixelColor(x, y).alpha():
+                    left, right = min(left, x), max(right, x)
+                    top, bottom = min(top, y), max(bottom, y)
+        if right < left or bottom < top:
+            return None
+        return image.rect().adjusted(left, top, -(image.width() - right - 1),
+                                     -(image.height() - bottom - 1))
+
+    def normalized_pixmap(self, icon, size):
+        """Center an icon's visible artwork in a square slot without distortion."""
+        density = 4
+        physical_size = size * density
+        source = icon.pixmap(QSize(physical_size, physical_size))
+        if source.isNull():
+            return source
+        bounds = self._opaque_bounds(source.toImage())
+        if bounds:
+            source = source.copy(bounds)
+        artwork = source.scaled(QSize(physical_size, physical_size),
+                                Qt.AspectRatioMode.KeepAspectRatio,
+                                Qt.TransformationMode.SmoothTransformation)
+        result = QPixmap(physical_size, physical_size)
+        result.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(result)
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+        painter.drawPixmap((physical_size - artwork.width()) // 2,
+                           (physical_size - artwork.height()) // 2, artwork)
+        painter.end()
+        result.setDevicePixelRatio(density)
+        return result
+
+    def catalog_icon_for_size(self, icon_id, size):
+        """Return a catalog icon normalized for a picker or card square slot."""
+        icon = self.catalog_icon(icon_id)
+        return QIcon(self.normalized_pixmap(icon, size)) if icon else QIcon()
+
+    def resolve_for_window(self, app_id, title, hostname=None, icon_override=None):
         label, app_icon = self.resolve(app_id)
+        manual = self.catalog_icon(icon_override) if icon_override else None
+        if manual is not None:
+            return label, manual
         if is_browser_app(app_id):
             site = site_for_hostname(hostname) if hostname is not None else site_for_title(title)
             if site:
                 return label, self._site_icon(site) or app_icon
         return label, app_icon
 
-    def rendered(self, app_id, size, title=None, hostname=None):
+    def rendered(self, app_id, size, title=None, hostname=None, icon_override=None):
         """Return a cached, smoothly downsampled icon without changing its ratio."""
         app_id = app_id or "Unknown application"
         site = None
         if is_browser_app(app_id):
             site = site_for_hostname(hostname) if hostname is not None else site_for_title(title)
-        key = (app_id, site, size)
+        key = (app_id, site, icon_override, size)
+        if icon_override:
+            self.catalog_icon(icon_override)
         if key not in self.pixmaps:
-            _label, icon = self.resolve_for_window(app_id, title, hostname)
-            source = icon.pixmap(QSize(size * 2, size * 2))
-            if not source.isNull():
-                ratio = source.devicePixelRatio()
-                target = QSize(round(size * ratio), round(size * ratio))
-                pixmap = source.scaled(target, Qt.AspectRatioMode.KeepAspectRatio,
-                                       Qt.TransformationMode.SmoothTransformation)
-                pixmap.setDevicePixelRatio(ratio)
-                self.pixmaps[key] = pixmap
-            else:
-                self.pixmaps[key] = source
+            _label, icon = self.resolve_for_window(app_id, title, hostname, icon_override)
+            self.pixmaps[key] = self.normalized_pixmap(icon, size)
         return self.pixmaps[key]

@@ -27,6 +27,8 @@ class Palette:
     focused_border: str
     focused_text: str
     pipe_colors: tuple[str, ...]
+    neutral_pipe: str
+    focused_route: str
     hint_background: str
     hint_border: str
     hint_text: str
@@ -40,6 +42,7 @@ DEFAULT_PALETTE = Palette(
     window_title="#737681", node_background="#fffcf8", node_border="#d2ccc4",
     focused_background="#cdd8ff", focused_border="#1e2e5a", focused_text="#1e2e5a",
     pipe_colors=("#a9cdbf", "#b9b6dd", "#dfbca7", "#d7b4c9"),
+    neutral_pipe="#d0d4dc", focused_route="#5fae76",
     hint_background="#cdd8ff", hint_border="#1e2e5a", hint_text="#1e2e5a",
     error_background="#f1deda", error_text="#8c4a4a",
 )
@@ -66,6 +69,7 @@ class DashboardSettings:
     overlay_min_width: int = 360
     overlay_min_height: int = 220
     overlay_opacity: float = 1.0
+    background_opacity: float = 1.0
 
     @classmethod
     def load(cls, path=None):
@@ -97,10 +101,17 @@ class DashboardSettings:
         overlay = parsed.get("overlay", {})
         if not isinstance(overlay, dict):
             overlay = {}
+        appearance = parsed.get("appearance", {})
+        if not isinstance(appearance, dict):
+            appearance = {}
 
         opacity = overlay.get("opacity", defaults.overlay_opacity)
         if isinstance(opacity, bool) or not isinstance(opacity, (int, float)) or not 0 <= opacity <= 1:
             opacity = defaults.overlay_opacity
+        background_opacity = appearance.get("background_opacity", defaults.background_opacity)
+        if isinstance(background_opacity, bool) or not isinstance(background_opacity, (int, float)):
+            background_opacity = defaults.background_opacity
+        background_opacity = max(0.0, min(1.0, float(background_opacity)))
 
         icon_size = integer(graph, "icon_size", defaults.icon_size, 16, 64)
         node_width = max(icon_size + 24, integer(graph, "node_width", defaults.node_width, 80, 240))
@@ -128,6 +139,7 @@ class DashboardSettings:
             overlay_min_width=integer(overlay, "min_width", defaults.overlay_min_width, 200, 7680),
             overlay_min_height=integer(overlay, "min_height", defaults.overlay_min_height, 150, 4320),
             overlay_opacity=float(opacity),
+            background_opacity=background_opacity,
         )
 
 
@@ -188,6 +200,7 @@ def parse_noctalia_css(text):
     selected_fg = token("theme_selected_fg_color", accent_fg)
     primary = token("window_fg_color", DEFAULT_PALETTE.primary_text)
     secondary = token("theme_unfocused_fg_color", token("view_fg_color", DEFAULT_PALETTE.secondary_text))
+    neutral_pipe = QColor(token("theme_unfocused_fg_color", DEFAULT_PALETTE.neutral_pipe)).darker(155)
     return Palette(
         dashboard_background=token("window_bg_color", DEFAULT_PALETTE.dashboard_background),
         primary_text=primary,
@@ -205,6 +218,8 @@ def parse_noctalia_css(text):
                      token("success_color", primary),
                      token("warning_color", token("destructive_bg_color", accent)),
                      token("destructive_bg_color", accent)),
+        neutral_pipe=neutral_pipe.name(QColor.NameFormat.HexRgb),
+        focused_route=accent,
         hint_background=token("accent_bg_color", selected_bg),
         hint_border=token("accent_fg_color", selected_fg),
         hint_text=token("accent_fg_color", selected_fg),

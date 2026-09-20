@@ -2,8 +2,10 @@
 from PySide6.QtCore import QObject, Signal, QTimer
 from .backend import Backend
 from .icons import Icons
+from .icon_overrides import IconOverrides
 from .browser_tabs import BrowserTabs
 from .appearance import AppearanceProvider
+from .hints import HintAssignments
 from . import niri
 
 
@@ -20,7 +22,10 @@ class DashboardController(QObject):
         self.backend = Backend(demo)
         self.appearance = AppearanceProvider()
         self.icons = Icons(self.appearance)
+        self.hint_assignments = HintAssignments()
+        self.icon_overrides = IconOverrides(enabled=not demo, parent=self)
         self.appearance.changed.connect(self._appearance_changed)
+        self.icon_overrides.changed.connect(self._publish_state)
         self.latest = None
         self.raw = None
         self.browser_tabs = BrowserTabs(self, enabled=not demo)
@@ -57,17 +62,46 @@ class DashboardController(QObject):
 
     def receive_state(self, data):
         self.raw = data
+        self.icon_overrides.prune(w["id"] for w in data["windows"] if not niri.is_overlay(w))
         self._publish_state()
         self.raw_state.emit(data)
 
     def _publish_state(self):
         if self.raw is None:
             return
-        filtered = dict(self.raw, windows=[self.browser_tabs.decorate(w)
-                        for w in self.raw["windows"] if not niri.is_overlay(w)])
+        windows = []
+        for window in self.raw["windows"]:
+            if niri.is_overlay(window):
+                continue
+            decorated = self.browser_tabs.decorate(window)
+            icon_override = self.icon_overrides.get(window["id"])
+            if icon_override:
+                decorated = dict(decorated, icon_override=icon_override)
+            windows.append(decorated)
+        filtered = dict(self.raw, windows=windows)
+        self.hint_assignments.update(self._hint_order(filtered))
         if filtered != self.latest:
             self.latest = filtered
             self.state.emit(filtered)
+
+    @staticmethod
+    def _hint_order(data):
+        """Match the graph's monitor/workspace/window order for every view."""
+        outputs = data["outputs"]
+        names = sorted((name for name, output in outputs.items() if output.get("logical")),
+                       key=lambda name: (outputs[name]["logical"].get("x", 0),
+                                         outputs[name]["logical"].get("y", 0)))
+        for workspace in data["workspaces"]:
+            if workspace.get("output") not in names:
+                names.append(workspace.get("output"))
+        result = []
+        for name in names:
+            workspaces = sorted((workspace for workspace in data["workspaces"]
+                                 if workspace.get("output") == name), key=lambda workspace: workspace["idx"])
+            for workspace in workspaces:
+                result.extend(window["id"] for window in niri.ordered(
+                    window for window in data["windows"] if window.get("workspace_id") == workspace["id"]))
+        return result
 
     def receive_health(self, connected, message):
         self.connected, self.health_message = connected, message

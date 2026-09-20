@@ -110,6 +110,10 @@ Invalid values use the defaults above. Restart the resident dashboard after edit
   to insert before its column, or after the final app to append. Empty
   workspaces accept drops too.
 - Click an app node to focus it. Hover to read its full title and position.
+- Middle-click an app node to assign a session-only custom icon. Type to search,
+  use arrow keys to choose an icon, Enter to assign it, or Escape to cancel.
+  “Reset to default icon” removes the assignment. Empty-space middle-drag still
+  pans the graph.
 - Wheel to zoom. Drag the background, middle-drag, or Space+drag to pan. Near an
   edge, dragging an app pans the graph automatically.
 - Press `F` to fit the graph, `Ctrl+0` to fit the persistent view, and `F11` to
@@ -161,6 +165,19 @@ rendered.
 QT_QPA_PLATFORM=offscreen PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -v
 niri validate -c examples/overlay.kdl
 ```
+
+## Session icon overrides
+
+Manual icon assignments belong to a specific Niri window ID, so two Zen or Kitty
+windows can use different icons. They are stored best-effort in
+`$XDG_RUNTIME_DIR/niridashboard/icon-overrides.json`; dashboard restarts in the
+same login retain them, while logout/reboot clears them naturally. Assignments for
+windows no longer reported by Niri are removed on a later refresh.
+
+The initial searchable catalog includes WhatsApp, YouTube, Gmail, GitHub, ChatGPT,
+Python, Docker, SSH, Terminal, Folder / project, Nuke, Firefox, and Zen Browser.
+It prefers installed icon-theme artwork and supplies a local monogram fallback when
+an icon theme has no matching logo.
 
 `tests/live_smoke.py` is an optional real-compositor check using temporary test
 windows and empty workspaces; it restores the original focus when complete.

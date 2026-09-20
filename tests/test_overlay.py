@@ -128,6 +128,33 @@ class OverlayTests(unittest.TestCase):
         self.assertEqual(dashboard.view.backgroundBrush().color().name(), dashboard.controller.appearance.palette.dashboard_background)
         dashboard.close()
 
+    def test_main_background_opacity_leaves_foreground_sharp(self):
+        controller = DashboardController(demo=True, start_backend=False)
+        controller.appearance.settings = replace(controller.appearance.settings, background_opacity=.5)
+        dashboard = Dashboard(demo=True, start_backend=False, controller=controller)
+        dashboard.resize(400, 300)
+        dashboard.show()
+        self.app.processEvents()
+        image = QImage(dashboard.size(), QImage.Format.Format_ARGB32_Premultiplied)
+        image.fill(Qt.GlobalColor.transparent)
+        dashboard.render(image)
+        self.assertTrue(dashboard.testAttribute(Qt.WidgetAttribute.WA_TranslucentBackground))
+        self.assertAlmostEqual(image.pixelColor(2, 2).alpha(), 128, delta=2)
+        dashboard.close()
+
+    def test_main_and_overlay_share_canonical_numeric_hints(self):
+        controller = DashboardController(demo=True, start_backend=False)
+        controller.receive_state(controller.backend.data)
+        dashboard = Dashboard(demo=True, start_backend=False, controller=controller)
+        overlay = OverlayWindow(controller)
+        overlay.view.render(controller.latest)
+        self.assertEqual(dashboard.view.hint_assignments.by_window,
+                         overlay.view.hint_assignments.by_window)
+        self.assertIs(dashboard.view.hint_assignments, controller.hint_assignments)
+        self.assertIs(overlay.view.hint_assignments, controller.hint_assignments)
+        overlay.shutdown()
+        dashboard.close()
+
     def test_overlay_identity_filter_does_not_filter_other_niri_windows(self):
         controller = DashboardController(demo=True, start_backend=False)
         state = demo_state()

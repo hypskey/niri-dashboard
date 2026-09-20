@@ -11,19 +11,22 @@ if __name__ == "__main__":
     from niridashboard.cli import main
     sys.exit(main())
 
-from PySide6.QtCore import QTimer
-from PySide6.QtGui import QKeySequence, QShortcut
+from PySide6.QtCore import QTimer, Qt
+from PySide6.QtGui import QColor, QKeySequence, QPainter, QShortcut
 from PySide6.QtWidgets import QHBoxLayout, QLabel, QMainWindow, QVBoxLayout, QWidget
 from niridashboard.controller import DashboardController
 from niridashboard.graph import GraphView
+from niridashboard.icon_catalog import DEFAULT_CATALOG
+from niridashboard.icon_picker import IconPicker
 
-def dashboard_style(palette, settings):
+def dashboard_style(palette, settings, transparent=False):
+    background = "transparent" if transparent else palette.dashboard_background
     return f"""
-QMainWindow, QWidget {{ background: {palette.dashboard_background}; color: {palette.primary_text}; font-family: '{settings.font_family}'; }}
+QMainWindow, QWidget {{ background: {background}; color: {palette.primary_text}; font-family: '{settings.font_family}'; }}
 QLabel#muted {{ color: {palette.secondary_text}; }}
 QLabel#error {{ color: {palette.error_text}; background: {palette.error_background}; padding: 10px; border-radius: 6px; }}
-QScrollBar:horizontal {{ height: 9px; background: {palette.dashboard_background}; }}
-QScrollBar:vertical {{ width: 9px; background: {palette.dashboard_background}; }}
+QScrollBar:horizontal {{ height: 9px; background: {background}; }}
+QScrollBar:vertical {{ width: 9px; background: {background}; }}
 QScrollBar::handle {{ background: {palette.node_border}; border-radius: 4px; min-width: 24px; min-height: 24px; }}
 QScrollBar::add-line, QScrollBar::sub-line {{ width: 0; height: 0; }}
 """
@@ -31,17 +34,21 @@ QScrollBar::add-line, QScrollBar::sub-line {{ width: 0; height: 0; }}
 
 class GraphWindow(QMainWindow):
     """Common graph/controller wiring; each window keeps its own scene and framing."""
-    def __init__(self, controller, translucent=False):
+    def __init__(self, controller, translucent=False, background_opacity=1.0):
         super().__init__()
         self.controller = controller
         self.backend = controller.backend  # Compatibility for callers inspecting the worker.
-        self.view = GraphView(controller.icons, translucent=translucent, appearance=controller.appearance)
+        self.view = GraphView(controller.icons, translucent=translucent, appearance=controller.appearance,
+                              hint_assignments=controller.hint_assignments,
+                              background_opacity=background_opacity)
         self.pending = None
         self.last_state = None
         self.error_kind = None
+        self.icon_picker = None
         self.view.move_requested.connect(lambda wid, ws, before: self.command("move", wid, ws, before))
         self.view.focus_requested.connect(lambda wid: self.command("focus", wid))
         self.view.close_requested.connect(lambda wid: self.command("close", wid))
+        self.view.icon_picker_requested.connect(self.open_icon_picker)
         self.view.interaction_finished.connect(self.apply_pending)
         controller.appearance_changed.connect(self.receive_appearance)
 
@@ -50,6 +57,22 @@ class GraphWindow(QMainWindow):
 
     def command(self, kind, *args):
         self.controller.action(self, kind, *args)
+
+    def open_icon_picker(self, window_id, position):
+        if self.icon_picker is not None:
+            self.icon_picker.close()
+        picker = IconPicker(DEFAULT_CATALOG, self.controller.icons,
+                            self.controller.appearance.palette, self.controller.appearance.settings, self)
+        self.icon_picker = picker
+        picker.selected.connect(lambda icon_id: self.controller.icon_overrides.set(window_id, icon_id))
+        picker.reset_requested.connect(lambda: self.controller.icon_overrides.reset(window_id))
+        picker.finished.connect(lambda: self._picker_finished(picker))
+        picker.finished.connect(picker.deleteLater)
+        picker.open_at(position)
+
+    def _picker_finished(self, picker):
+        if self.icon_picker is picker:
+            self.icon_picker = None
 
     def action_started(self, kind):
         self.error.hide()
@@ -97,14 +120,19 @@ class Dashboard(GraphWindow):
     def __init__(self, demo=False, start_backend=True, controller=None):
         self.owns_controller = controller is None
         controller = controller or DashboardController(demo, start_backend)
-        super().__init__(controller)
+        self.background_opacity = controller.appearance.settings.background_opacity
+        super().__init__(controller, translucent=self.background_opacity < 1,
+                         background_opacity=self.background_opacity)
         self.setWindowTitle("Niri Dashboard")
         self.resize(1440, 900)
         self.setMinimumSize(760, 480)
         palette = controller.appearance.palette
         settings = controller.appearance.settings
-        self.setStyleSheet(dashboard_style(palette, settings))
+        if self.background_opacity < 1:
+            self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setStyleSheet(dashboard_style(palette, settings, self.background_opacity < 1))
         root = QWidget()
+        root.setObjectName("niridashboard-main-root")
         layout = QVBoxLayout(root)
         layout.setContentsMargins(24, 20, 24, 12)
         layout.setSpacing(12)
@@ -147,6 +175,15 @@ class Dashboard(GraphWindow):
             self.shortcuts.append(shortcut)
         controller.attach(self)
 
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        if self.background_opacity < 1:
+            color = QColor(self.controller.appearance.palette.dashboard_background)
+            color.setAlphaF(self.background_opacity)
+            painter = QPainter(self)
+            painter.fillRect(event.rect(), color)
+            painter.end()
+
     def toggle_fullscreen(self):
         self.showNormal() if self.isFullScreen() else self.showFullScreen()
 
@@ -177,7 +214,7 @@ class Dashboard(GraphWindow):
         super().receive_appearance()
         palette = self.controller.appearance.palette
         settings = self.controller.appearance.settings
-        self.setStyleSheet(dashboard_style(palette, settings))
+        self.setStyleSheet(dashboard_style(palette, settings, self.background_opacity < 1))
         self.badge.setStyleSheet(f"color: {palette.focused_text}; padding: 5px 9px; background: {palette.focused_background}; border-radius: 5px;")
         self.status.setStyleSheet(f"color: {palette.output_label};")
 

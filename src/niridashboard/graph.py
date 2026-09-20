@@ -1,8 +1,8 @@
 """A mouse-operated graph of monitor branches, workspace rows and app nodes."""
 import math
 from PySide6.QtCore import QPointF, QRectF, Qt, Signal, QTimer
-from PySide6.QtGui import QColor, QFont, QPainter, QPainterPath, QPen, QCursor, QLinearGradient
-from PySide6.QtWidgets import QApplication, QGraphicsLineItem, QGraphicsItem, QGraphicsObject, QGraphicsScene, QGraphicsView
+from PySide6.QtGui import QColor, QFont, QPainter, QPainterPath, QPen, QCursor, QLinearGradient, QTransform
+from PySide6.QtWidgets import QApplication, QGraphicsLineItem, QGraphicsItem, QGraphicsObject, QGraphicsRectItem, QGraphicsScene, QGraphicsView
 from .appearance import DEFAULT_PALETTE, DashboardSettings
 from .hints import HintAssignments
 from .niri import ordered, position
@@ -25,7 +25,8 @@ class AppNode(QGraphicsObject):
         self.window = window
         self.icons = icons
         self.label, self.icon = icons.resolve_for_window(
-            window.get("app_id"), window.get("title"), window.get("browser_hostname"))
+            window.get("app_id"), window.get("title"), window.get("browser_hostname"),
+            window.get("icon_override"))
         self.color = color
         self.hint = str(hint) if hint is not None else ""
         self.palette = palette or DEFAULT_PALETTE
@@ -63,7 +64,7 @@ class AppNode(QGraphicsObject):
         p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
         pixmap = self.icons.rendered(
             self.window.get("app_id"), icon_size, self.window.get("title"),
-            self.window.get("browser_hostname"))
+            self.window.get("browser_hostname"), self.window.get("icon_override"))
         if not pixmap.isNull():
             pixmap_size = pixmap.deviceIndependentSize()
             px = icon_x + (icon_size - pixmap_size.width()) / 2
@@ -104,27 +105,33 @@ class GraphView(QGraphicsView):
     move_requested = Signal(int, int, object)
     focus_requested = Signal(int)
     close_requested = Signal(int)
+    icon_picker_requested = Signal(int, object)
     escape_pressed = Signal()
     interaction_finished = Signal()
     hint = Signal(str)
     zoom_changed = Signal(int)
     numeric_pressed = Signal(str)
 
-    def __init__(self, icons, translucent=False, appearance=None):
+    def __init__(self, icons, translucent=False, appearance=None, hint_assignments=None, background_opacity=1.0):
         super().__init__()
         self.setScene(QGraphicsScene(self))
         self.icons = icons
         self.translucent = translucent
+        self.background_opacity = background_opacity
         self.numeric_selection_enabled = False
         self.appearance = appearance
         self.colors = appearance.palette if appearance else DEFAULT_PALETTE
         self.settings = appearance.settings if appearance else DashboardSettings()
-        self.hint_assignments = HintAssignments()
+        self.hint_assignments = hint_assignments or HintAssignments()
+        self.shared_hint_assignments = hint_assignments is not None
         self.nodes = {}
         self.rows = []
+        self.trailing_targets = []
         self.data = None
         self.pressed = None
         self.dragging = False
+        self.drag_scene_rect = None
+        self.drag_transform = None
         self.panning = False
         self.busy = False
         self.connected = False
@@ -210,6 +217,7 @@ class GraphView(QGraphicsView):
         self.scene().clear()
         self.nodes = {}
         self.rows = []
+        self.trailing_targets = []
         self.marker = None
         outputs = data["outputs"]
         names = sorted([name for name, out in outputs.items() if out.get("logical")],
@@ -224,14 +232,25 @@ class GraphView(QGraphicsView):
         branches = []
         ordered_window_ids = []
         for name in names:
-            workspaces = sorted([w for w in data["workspaces"] if w.get("output") == name], key=lambda w: w["idx"])
-            groups = [ordered([w for w in data["windows"] if w.get("workspace_id") == ws["id"]]) for ws in workspaces]
+            all_workspaces = sorted([w for w in data["workspaces"] if w.get("output") == name], key=lambda w: w["idx"])
+            all_groups = [ordered([w for w in data["windows"] if w.get("workspace_id") == ws["id"]]) for ws in all_workspaces]
+            last_occupied = max((index for index, windows in enumerate(all_groups) if windows), default=None)
+            trailing_workspace = None
+            if last_occupied is None:
+                workspaces, groups = all_workspaces[:1], all_groups[:1]
+            else:
+                workspaces, groups = all_workspaces[:last_occupied + 1], all_groups[:last_occupied + 1]
+                if last_occupied + 1 < len(all_workspaces):
+                    trailing_workspace = all_workspaces[last_occupied + 1]
             ordered_window_ids.extend(window["id"] for group in groups for window in group)
-            branches.append((name, workspaces, groups))
-        hint_by_id = self.hint_assignments.update(ordered_window_ids)
+            branches.append((name, workspaces, groups, trailing_workspace))
+        hint_by_id = (dict(self.hint_assignments.by_window) if self.shared_hint_assignments
+                      else self.hint_assignments.update(ordered_window_ids))
         x = self.settings.graph_padding
-        for branch, (name, workspaces, groups) in enumerate(branches):
-            color = self.colors.pipe_colors[branch % len(self.colors.pipe_colors)]
+        focused_window = next((window for window in data["windows"] if window.get("is_focused")), None)
+        focused_workspace_id = focused_window.get("workspace_id") if focused_window else None
+        for branch, (name, workspaces, groups, trailing_workspace) in enumerate(branches):
+            color = self.colors.neutral_pipe
             step, row_height = self.settings.workspace_step, self.settings.workspace_row
             width = max(self.settings.node_width + 262, 152 + max((len(w) for w in groups), default=0) * step)
             self.line(x + 20, 67, x + 20, 114 + max(0, len(workspaces) - 1) * row_height + 27, color, 3)
@@ -265,10 +284,41 @@ class GraphView(QGraphicsView):
                     pos = position(window)
                     if pos and sum(bool(position(w)) and position(w)[0] == pos[0] for w in windows) > 1:
                         self.text(f"STACK {pos[0]} · {pos[1]}", nx + 15, y + self.settings.node_height + 4, max(6, self.settings.normal_text_size - 2), self.colors.secondary_text)
+            focus_row = next((index for index, ws in enumerate(workspaces)
+                              if ws["id"] == focused_workspace_id), None)
+            if focus_row is not None:
+                focus_windows = groups[focus_row]
+                focus_index = next((index for index, window in enumerate(focus_windows)
+                                    if window["id"] == focused_window["id"]), None)
+                if focus_index is not None:
+                    accent = self.colors.focused_route
+                    focus_y = 114 + focus_row * row_height + 27
+                    # Draw the accent over the neutral geometry so both routes share
+                    # exactly the same coordinates and keep all interaction items intact.
+                    self.line(x + 20, 67, x + 20, focus_y, accent, 4)
+                    for row in range(focus_row + 1):
+                        y = 114 + row * row_height
+                        is_target = row == focus_row
+                        dot = self.scene().addEllipse(
+                            x + 14, y + 21, 12, 12, QPen(QColor(accent), 3),
+                            QColor(accent) if is_target else QColor(self.colors.dashboard_background))
+                        dot.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+                    self.line(x + 20, focus_y, x + 137, focus_y, accent, 4)
+                    for index in range(1, focus_index + 1):
+                        nx = x + 110 + index * step
+                        self.line(nx - step + self.settings.node_width - 27, focus_y,
+                                  nx + 27, focus_y, accent, 4)
+            if trailing_workspace and workspaces:
+                target_y = 114 + len(workspaces) * row_height - 20
+                self.trailing_targets.append({
+                    "workspace": trailing_workspace,
+                    "rect": QRectF(x + 45, target_y, width - 45, max(72, self.settings.node_height)),
+                    "output": name,
+                })
             x += width + self.settings.branch_gap
         padding = self.settings.graph_padding
         self.scene().setSceneRect(self.scene().itemsBoundingRect().adjusted(-padding, -padding, padding + 30, padding + 30))
-        if self.auto_fit:
+        if self.auto_fit and not self.dragging:
             self.fit_graph()
 
     @property
@@ -276,6 +326,8 @@ class GraphView(QGraphicsView):
         return {str(hint): window_id for window_id, hint in self.hint_assignments.by_window.items()}
 
     def fit_graph(self):
+        if self.dragging:
+            return
         self.auto_fit = True
         self.fitInView(self.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio)
         if self.transform().m11() > 1.3:
@@ -284,6 +336,8 @@ class GraphView(QGraphicsView):
         self.zoom_changed.emit(round(self.transform().m11() * 100))
 
     def zoom(self, factor):
+        if self.dragging:
+            return
         value = self.transform().m11() * factor
         if 0.12 <= value <= 2.5:
             self.auto_fit = False
@@ -292,7 +346,7 @@ class GraphView(QGraphicsView):
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
-        if self.auto_fit:
+        if self.auto_fit and not self.dragging:
             self.fit_graph()
 
     def wheelEvent(self, event):
@@ -309,7 +363,18 @@ class GraphView(QGraphicsView):
                 self.close_requested.emit(node.window["id"])
             event.accept()
             return
-        if event.button() == Qt.MouseButton.MiddleButton or (event.button() == Qt.MouseButton.LeftButton and self.space):
+        if event.button() == Qt.MouseButton.MiddleButton:
+            node = self.node_at(event.position().toPoint())
+            if node and not self.interacting:
+                self.icon_picker_requested.emit(node.window["id"], self.viewport().mapToGlobal(event.position().toPoint()))
+                event.accept()
+                return
+            self.panning = True
+            self.pan_start = event.position().toPoint()
+            self.setCursor(Qt.CursorShape.ClosedHandCursor)
+            event.accept()
+            return
+        if event.button() == Qt.MouseButton.LeftButton and self.space:
             self.panning = True
             self.pan_start = event.position().toPoint()
             self.setCursor(Qt.CursorShape.ClosedHandCursor)
@@ -343,6 +408,8 @@ class GraphView(QGraphicsView):
         if self.pressed:
             if not self.dragging and (point - self.press_point).manhattanLength() >= QApplication.startDragDistance():
                 self.dragging = True
+                self.drag_scene_rect = QRectF(self.sceneRect())
+                self.drag_transform = QTransform(self.transform())
                 self.pressed.setZValue(50)
                 self.pressed.setOpacity(0.85)
                 self.edge_timer.start()
@@ -381,6 +448,25 @@ class GraphView(QGraphicsView):
             self.hint.emit(f"Move to {row['workspace'].get('output') or 'unassigned'} / {destination} · {where}")
             break
         if self.drop is None:
+            for target in self.trailing_targets:
+                if not target["rect"].contains(scene_pos):
+                    continue
+                self.drop = target["workspace"]["id"], None
+                self.marker = QGraphicsRectItem(target["rect"])
+                self.marker.setPen(QPen(QColor(self.colors.focused_route), 2, Qt.PenStyle.DashLine))
+                self.marker.setBrush(QColor(self.colors.node_background))
+                self.marker.setZValue(40)
+                self.marker.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+                self.scene().addItem(self.marker)
+                label = self.text("+ Create workspace", 0, 0, self.settings.normal_text_size,
+                                  self.colors.focused_route, True)
+                label.setParentItem(self.marker)
+                label.setPos((target["rect"].width() - label.boundingRect().width()) / 2,
+                             (target["rect"].height() - label.boundingRect().height()) / 2)
+                self.scene().setSceneRect(self.sceneRect().united(target["rect"]).adjusted(-8, -8, 8, 8))
+                self.hint.emit(f"Move to {target['output'] or 'unassigned'} / create workspace")
+                break
+        if self.drop is None:
             self.hint.emit("Drop on a workspace row · Esc cancels")
 
     def edge_pan(self):
@@ -396,6 +482,7 @@ class GraphView(QGraphicsView):
 
     def cancel_drag(self):
         self.edge_timer.stop()
+        was_dragging = self.dragging
         if self.pressed:
             self.pressed.setPos(self.origin)
             self.pressed.setOpacity(1)
@@ -403,6 +490,12 @@ class GraphView(QGraphicsView):
         if self.marker:
             self.scene().removeItem(self.marker)
             self.marker = None
+        if was_dragging and self.drag_scene_rect is not None:
+            self.scene().setSceneRect(self.drag_scene_rect)
+            if self.drag_transform is not None:
+                self.setTransform(self.drag_transform)
+        self.drag_scene_rect = None
+        self.drag_transform = None
         self.pressed = None
         self.dragging = False
         self.drop = None
@@ -461,14 +554,12 @@ class GraphView(QGraphicsView):
         super().focusOutEvent(event)
 
     def drawBackground(self, p, rect):
-        if self.translucent:
-            # Leave untouched pixels at alpha 0 so Niri's desktop shows through.
-            return
-        p.fillRect(rect, QColor(self.colors.dashboard_background))
+        if not self.translucent:
+            p.fillRect(rect, QColor(self.colors.dashboard_background))
         if not self.background_grid:
             return
         grid_color = QColor(self.colors.secondary_text)
-        grid_color.setAlpha(22)
+        grid_color.setAlpha(round(22 * self.background_opacity))
         p.setPen(QPen(grid_color, 1))
         step = 28 if self.transform().m11() > 0.4 else 56
         for x in range(math.floor(rect.left() / step) * step, math.ceil(rect.right()), step):
