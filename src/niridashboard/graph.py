@@ -1,10 +1,11 @@
 """A mouse-operated graph of monitor branches, workspace rows and app nodes."""
 import math
-from PySide6.QtCore import QPointF, QRectF, Qt, Signal, QTimer
+from PySide6.QtCore import QPointF, QRectF, Qt, Signal, QTimer, QElapsedTimer
 from PySide6.QtGui import QColor, QFont, QPainter, QPainterPath, QPen, QCursor, QLinearGradient, QTransform
 from PySide6.QtWidgets import QApplication, QGraphicsLineItem, QGraphicsItem, QGraphicsObject, QGraphicsRectItem, QGraphicsScene, QGraphicsView
 from .appearance import DEFAULT_PALETTE, DashboardSettings
 from .hints import HintAssignments
+from .focus_path import FocusPath
 from .niri import ordered, position
 
 BG = DEFAULT_PALETTE.dashboard_background
@@ -163,7 +164,42 @@ class GraphView(QGraphicsView):
         self.edge_timer = QTimer(self)
         self.edge_timer.setInterval(16)
         self.edge_timer.timeout.connect(self.edge_pan)
+        self.focus_path = None
+        self.flow_distance = 0.0
+        self.flow_clock = QElapsedTimer()
+        self.flow_timer = QTimer(self)
+        self.flow_timer.setInterval(33)
+        self.flow_timer.timeout.connect(self._animate_focus_path)
         self.interaction_finished.connect(self._finish_appearance_update)
+
+    def _sync_flow_timer(self):
+        running = self.isVisible() and self.focus_path is not None and self.settings.focus_path_flow
+        if running and not self.flow_timer.isActive():
+            self.flow_clock.start()
+            self.flow_timer.start()
+        elif not running:
+            self.flow_timer.stop()
+
+    def _animate_focus_path(self):
+        if self.focus_path is None:
+            self.flow_timer.stop()
+            return
+        seconds = self.flow_clock.nsecsElapsed() / 1_000_000_000
+        self.flow_clock.restart()
+        self.flow_distance = (self.flow_distance + seconds * FocusPath.SPEED *
+                              self.settings.focus_path_flow_speed) % FocusPath.PERIOD
+        self.focus_path.set_distance(self.flow_distance)
+        # QGraphicsItem.update(rect) merges an item's dirty rectangles into one
+        # large box. Submit the two route legs directly to the view instead.
+        self.updateScene(list(self.focus_path.dirty_rects))
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self._sync_flow_timer()
+
+    def hideEvent(self, event):
+        self.flow_timer.stop()
+        super().hideEvent(event)
 
     @property
     def interacting(self):
@@ -214,6 +250,7 @@ class GraphView(QGraphicsView):
 
     def render(self, data):
         self.data = data
+        self.focus_path = None
         self.scene().clear()
         self.nodes = {}
         self.rows = []
@@ -278,6 +315,10 @@ class GraphView(QGraphicsView):
                     if index:
                         self.line(nx - step + self.settings.node_width - 27, y + 27, nx + 27, y + 27, color)
                     node = AppNode(window, self.icons, color, hint_by_id.get(window["id"]), self.colors, self.settings)
+                    if self.settings.focus_path_flow:
+                        # Flow repaints run behind cards: reuse their sharp device-
+                        # scale rendering until hover/state/transform invalidates it.
+                        node.setCacheMode(QGraphicsItem.CacheMode.DeviceCoordinateCache)
                     node.setPos(nx, y)
                     self.scene().addItem(node)
                     self.nodes[window["id"]] = node
@@ -293,21 +334,15 @@ class GraphView(QGraphicsView):
                 if focus_index is not None:
                     accent = self.colors.focused_route
                     focus_y = 114 + focus_row * row_height + 27
-                    # Draw the accent over the neutral geometry so both routes share
-                    # exactly the same coordinates and keep all interaction items intact.
-                    self.line(x + 20, 67, x + 20, focus_y, accent, 4)
-                    for row in range(focus_row + 1):
-                        y = 114 + row * row_height
-                        is_target = row == focus_row
-                        dot = self.scene().addEllipse(
-                            x + 14, y + 21, 12, 12, QPen(QColor(accent), 3),
-                            QColor(accent) if is_target else QColor(self.colors.dashboard_background))
-                        dot.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
-                    self.line(x + 20, focus_y, x + 137, focus_y, accent, 4)
-                    for index in range(1, focus_index + 1):
-                        nx = x + 110 + index * step
-                        self.line(nx - step + self.settings.node_width - 27, focus_y,
-                                  nx + 27, focus_y, accent, 4)
+                    # Keep the same root, junctions and destination. Intermediate
+                    # cards mask the continuous path at their existing z-order.
+                    self.focus_path = FocusPath(
+                        QPointF(x + 20, 67),
+                        [QPointF(x + 20, 114 + row * row_height + 27)
+                         for row in range(focus_row + 1)],
+                        QPointF(x + 137 + focus_index * step, focus_y),
+                        accent, self.colors.dashboard_background, self.settings, self.flow_distance)
+                    self.scene().addItem(self.focus_path)
             if trailing_workspace and workspaces:
                 target_y = 114 + len(workspaces) * row_height - 20
                 self.trailing_targets.append({
@@ -320,6 +355,7 @@ class GraphView(QGraphicsView):
         self.scene().setSceneRect(self.scene().itemsBoundingRect().adjusted(-padding, -padding, padding + 30, padding + 30))
         if self.auto_fit and not self.dragging:
             self.fit_graph()
+        self._sync_flow_timer()
 
     @property
     def hint_targets(self):

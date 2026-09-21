@@ -85,6 +85,11 @@ workspace_row = 144
 branch_gap = 60
 graph_padding = 32
 
+[focus_path]
+glow = true
+flow = true
+flow_speed = 1.0
+
 [overlay]
 opacity = 1.0
 max_width_percent = 86
@@ -103,6 +108,13 @@ graph automatically within these limits. Lower the percentages for a smaller
 overlay; raise the minimum sizes to give a small graph a larger window. Maximum
 limits take precedence over configured minimums, subject to Qt's 200 × 150 minimum.
 Invalid values use the defaults above. Restart the resident dashboard after editing.
+
+The focused route uses the Noctalia accent with two soft glow strokes and a
+directional tracer. `glow = false` removes the glow and endpoint halo;
+`flow = false` hides the tracer and stops its timer. Disable both for a sharp,
+static accent route. `flow_speed` is a multiplier from 0.1 to 5.0 (default 1.0).
+Animation runs at approximately 30 FPS only in visible views with a focused
+route, independently of Niri refreshes; hidden overlays do not animate.
 
 ## Interacting with the graph
 

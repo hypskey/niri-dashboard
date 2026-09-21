@@ -70,6 +70,9 @@ class DashboardSettings:
     overlay_min_height: int = 220
     overlay_opacity: float = 1.0
     background_opacity: float = 1.0
+    focus_path_glow: bool = True
+    focus_path_flow: bool = True
+    focus_path_flow_speed: float = 1.0
 
     @classmethod
     def load(cls, path=None):
@@ -104,6 +107,14 @@ class DashboardSettings:
         appearance = parsed.get("appearance", {})
         if not isinstance(appearance, dict):
             appearance = {}
+        focus_path = parsed.get("focus_path", {})
+        if not isinstance(focus_path, dict):
+            focus_path = {}
+        glow = focus_path.get("glow", defaults.focus_path_glow)
+        flow = focus_path.get("flow", defaults.focus_path_flow)
+        flow_speed = focus_path.get("flow_speed", defaults.focus_path_flow_speed)
+        if isinstance(flow_speed, bool) or not isinstance(flow_speed, (int, float)) or not .1 <= flow_speed <= 5:
+            flow_speed = defaults.focus_path_flow_speed
 
         opacity = overlay.get("opacity", defaults.overlay_opacity)
         if isinstance(opacity, bool) or not isinstance(opacity, (int, float)) or not 0 <= opacity <= 1:
@@ -140,6 +151,9 @@ class DashboardSettings:
             overlay_min_height=integer(overlay, "min_height", defaults.overlay_min_height, 150, 4320),
             overlay_opacity=float(opacity),
             background_opacity=background_opacity,
+            focus_path_glow=glow if isinstance(glow, bool) else defaults.focus_path_glow,
+            focus_path_flow=flow if isinstance(flow, bool) else defaults.focus_path_flow,
+            focus_path_flow_speed=float(flow_speed),
         )
 
 

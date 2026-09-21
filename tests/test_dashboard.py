@@ -182,37 +182,30 @@ class GraphTests(unittest.TestCase):
         for window in state["windows"]:
             window["is_focused"] = window["id"] == target["id"]
         self.dashboard.receive_state(state)
-        accent = self.view.colors.focused_route.lower()
         neutral = self.view.colors.neutral_pipe.lower()
         lines = [item for item in self.view.scene().items()
                  if isinstance(item, QGraphicsLineItem) and item.parentItem() is None]
-        accent_lines = [item for item in lines if item.pen().color().name().lower() == accent and item.pen().widthF() == 4]
         normal_lines = [item for item in lines if item.pen().widthF() in (2, 3)]
-        self.assertEqual(len(accent_lines), 3)  # trunk, branch, and the segment before app two
+        route = self.view.focus_path
+        self.assertEqual(route.accent.name(), self.view.colors.focused_route.lower())
+        self.assertEqual(route.endpoint, self.view.nodes[target['id']].pos() + QPointF(27, 27))
+        self.assertEqual(route.path.elementCount(), 3)
+        self.assertEqual(len(route.junctions), 1)
         self.assertTrue(normal_lines)
         self.assertTrue(all(item.pen().color().name().lower() == neutral for item in normal_lines))
-        del lines, accent_lines, normal_lines
+        del lines, normal_lines
 
         refreshed = demo_state()
         self.dashboard.receive_state(refreshed)
-        lines = [item for item in self.view.scene().items()
-                 if isinstance(item, QGraphicsLineItem) and item.parentItem() is None]
-        accent_lines = [item for item in lines if item.pen().color().name().lower() == accent and item.pen().widthF() == 4]
-        self.assertEqual(len(accent_lines), 2)  # focus returned to the first window in the first workspace
-        del lines, accent_lines
+        self.assertEqual(self.view.focus_path.endpoint, self.view.nodes[1].pos() + QPointF(27, 27))
 
         second_workspace = demo_state()
         target = next(window for window in second_workspace["windows"] if window["workspace_id"] == 5)
         for window in second_workspace["windows"]:
             window["is_focused"] = window["id"] == target["id"]
         self.dashboard.receive_state(second_workspace)
-        lines = [item for item in self.view.scene().items()
-                 if isinstance(item, QGraphicsLineItem) and item.parentItem() is None]
-        trunk = next(item.line() for item in lines
-                     if item.pen().color().name().lower() == accent and item.pen().widthF() == 4
-                     and item.line().x1() == item.line().x2())
-        self.assertGreater(trunk.y2(), trunk.y1())
-        self.assertGreater(trunk.y2(), 141)  # route reaches the second workspace junction
+        self.assertEqual(len(self.view.focus_path.junctions), 2)
+        self.assertGreater(self.view.focus_path.junctions[-1].y(), 141)
 
     def test_right_click_closes_target_without_focusing(self):
         QTest.mouseClick(self.view.viewport(), Qt.MouseButton.RightButton, pos=self.center(2))
