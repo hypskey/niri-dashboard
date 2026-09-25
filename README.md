@@ -85,10 +85,16 @@ workspace_row = 144
 branch_gap = 60
 graph_padding = 32
 
+[appearance]
+global_scale = 1.0
+background_opacity = 1.0
+
+[ui]
+show_hud = true
+show_pet = true
+
 [focus_path]
 glow = true
-flow = true
-flow_speed = 1.0
 
 [overlay]
 opacity = 1.0
@@ -97,6 +103,14 @@ max_height_percent = 86
 min_width = 360
 min_height = 220
 ```
+
+`global_scale` uniformly adjusts UI density for fonts, application icons,
+cards, graph strokes, the pet, status HUD, and icon picker. Values are clamped
+to `0.6`–`2.0`; `1.0` is the native size. It does not change the camera zoom:
+the graph still opens fitted, wheel zoom remains manual, and `F`, `Ctrl+0`, or
+a double-click on empty graph space restores the fitted 100% view.
+
+`background_opacity` controls only the main dashboard background.
 
 `opacity` controls only the overlay background: `0.0` is fully transparent,
 `1.0` is solid (default), and `0.8` is 80% opaque. Nodes, icons, connections, and
@@ -109,20 +123,20 @@ overlay; raise the minimum sizes to give a small graph a larger window. Maximum
 limits take precedence over configured minimums, subject to Qt's 200 × 150 minimum.
 Invalid values use the defaults above. Restart the resident dashboard after editing.
 
-The focused route uses the Noctalia accent with two soft glow strokes and a
-directional tracer. `glow = false` removes the glow and endpoint halo;
-`flow = false` hides the tracer and stops its timer. Disable both for a sharp,
-static accent route. `flow_speed` is a multiplier from 0.1 to 5.0 (default 1.0).
-Animation runs at approximately 30 FPS only in visible views with a focused
-route, independently of Niri refreshes; hidden overlays do not animate.
+The focused route uses the Noctalia accent with two soft, static glow strokes.
+`glow = false` removes the glow and endpoint halo, leaving a sharp accent route.
 
 ## Interacting with the graph
 
 - Drag an app node to a workspace on any monitor to move it. Drop before an app
   to insert before its column, or after the final app to append. Empty
   workspaces accept drops too.
-- Click an app node to focus it. Hover to read its full title and position.
-- Middle-click an app node to assign a session-only custom icon. Type to search,
+- Click an app node to focus it. Ctrl+click or Ctrl+tap requests a normal close;
+  a second Ctrl+click/tap on the same card within 600 ms force-closes its
+  process. Right-click still requests a normal close. Force-close refuses a
+  process shared by other windows, so it cannot take down every browser window.
+  Hover to read the full title and position.
+- Middle-click or Alt+click/tap an app node to assign a session-only custom icon. Type to search,
   use arrow keys to choose an icon, Enter to assign it, or Escape to cancel.
   “Reset to default icon” removes the assignment. Empty-space middle-drag still
   pans the graph.
@@ -136,6 +150,36 @@ The filled workspace junction marks the active workspace. A colored app border
 marks the focused window; amber dots mark urgent windows. The dashboard shows
 existing workspaces, including trailing empty workspaces. It does not create
 workspaces or manage monitor configuration.
+
+## Pet attention cues
+
+The resident dashboard listens locally for desktop notifications sent through
+`org.freedesktop.Notifications` (`dbus-monitor` must be installed). A cue appears
+only when it can be attributed to one open Niri window. The pet shows that
+app's name and its existing numeric window hint for nine seconds. Ordinary
+cues clear when the window is focused or disappears; browser cues also clear
+if its active tab changes. Codex prompts can appear even when its terminal is
+already focused.
+Repeats are limited to one cue per window every 75 seconds (12 seconds for
+Codex prompts),
+with at least six seconds between cues. While a cue is visible, the pet stays
+awake and in place, but still blinks and moves her tail. Clicking the pet clears
+the cue.
+
+The first filter recognizes Google Chat, Gmail, Proton Mail, WhatsApp, and
+ChatGPT notifications for browser windows, plus a small set of native mail/chat
+apps and Codex/terminal notifications. Multiple browser windows are resolved
+using active-tab hostnames from the optional local Zen/Firefox extension; if a
+notification could belong to several windows, the pet stays quiet. A
+site-specific notification can still point to the only open browser window
+when its alert came from a background tab. Folder and window-title changes
+never trigger a cue. With several browser windows, background-tab alerts that
+cannot be correlated are ignored. Kitty reports Codex alerts under the Kitty
+app name, so the listener matches the local notification sender PID to Niri's
+terminal PID and checks for a running Codex child process. The window's Codex
+icon/title can also identify it when present. Codex terminal
+cues require a desktop notification; a terminal title change alone is
+intentionally insufficient.
 
 App order follows Niri's column and row positions. Existing stacked columns are
 flattened and labeled `STACK column · row`; this alpha does not create or
@@ -190,6 +234,12 @@ The initial searchable catalog includes WhatsApp, YouTube, Gmail, GitHub, ChatGP
 Python, Docker, SSH, Terminal, Folder / project, Nuke, Firefox, and Zen Browser.
 It prefers installed icon-theme artwork and supplies a local monogram fallback when
 an icon theme has no matching logo.
+
+To add a manual logo, place a self-contained SVG or a high-resolution PNG in
+`assets/icons/`. Its filename becomes its searchable name and stable ID. New files
+are discovered at startup; while the dashboard is running, press the small refresh
+button at the bottom-right of the icon picker to add them without restarting.
+Curated catalog entries keep their existing names and artwork.
 
 `tests/live_smoke.py` is an optional real-compositor check using temporary test
 windows and empty workspaces; it restores the original focus when complete.

@@ -51,9 +51,13 @@ class Backend(QThread):
                             niri.focus_window(*args)
                         elif kind == "close":
                             niri.close_window(*args)
+                        elif kind == "force_close":
+                            niri.force_close_window(*args)
                         else:
                             raise ValueError(f"Unknown action: {kind}")
-                        outcome = (True, {"move": "Window moved", "focus": "Window focused", "close": "Close requested"}[kind])
+                        outcome = (True, {"move": "Window moved", "focus": "Window focused",
+                                          "close": "Close requested",
+                                          "force_close": "Window force-closed"}[kind])
                 except Exception as error:
                     if kind == "_task":
                         task_result = (args[0], False, str(error))
@@ -78,7 +82,7 @@ class Backend(QThread):
                 self.task_finished.emit(*task_result)
 
     def demo_action(self, kind, args):
-        if kind == "close":
+        if kind in ("close", "force_close"):
             self.data["windows"] = [w for w in self.data["windows"] if w["id"] != args[0]]
             return
         if kind == "focus":

@@ -3,7 +3,9 @@ from PySide6.QtCore import QObject, Signal, QTimer
 from .backend import Backend
 from .icons import Icons
 from .icon_overrides import IconOverrides
+from .icon_usage import IconUsage
 from .browser_tabs import BrowserTabs
+from .attention import AttentionManager
 from .appearance import AppearanceProvider
 from .hints import HintAssignments
 from . import niri
@@ -24,15 +26,18 @@ class DashboardController(QObject):
         self.icons = Icons(self.appearance)
         self.hint_assignments = HintAssignments()
         self.icon_overrides = IconOverrides(enabled=not demo, parent=self)
+        self.icon_usage = IconUsage(enabled=not demo)
         self.appearance.changed.connect(self._appearance_changed)
         self.icon_overrides.changed.connect(self._publish_state)
         self.latest = None
         self.raw = None
         self.browser_tabs = BrowserTabs(self, enabled=not demo)
         self.browser_tabs.changed.connect(self._publish_state)
+        self.attention = AttentionManager(self, enabled=not demo)
         self.connected = False
         self.health_message = "Starting…"
         self.action_origin = None
+        self.pending_force_close = None
         self.transition = False
         self.stopping = False
         self.backend.state.connect(self.receive_state)
@@ -80,6 +85,7 @@ class DashboardController(QObject):
             windows.append(decorated)
         filtered = dict(self.raw, windows=windows)
         self.hint_assignments.update(self._hint_order(filtered))
+        self.attention.update_state(filtered, self.hint_assignments.by_window)
         if filtered != self.latest:
             self.latest = filtered
             self.state.emit(filtered)
@@ -87,6 +93,8 @@ class DashboardController(QObject):
     @staticmethod
     def _hint_order(data):
         """Match the graph's monitor/workspace/window order for every view."""
+        if "outputs" not in data or "workspaces" not in data:
+            return [window["id"] for window in data["windows"]]
         outputs = data["outputs"]
         names = sorted((name for name, output in outputs.items() if output.get("logical")),
                        key=lambda name: (outputs[name]["logical"].get("x", 0),
@@ -112,7 +120,12 @@ class DashboardController(QObject):
         self.busy_changed.emit(self.busy)
 
     def action(self, origin, kind, *args):
-        if not self.connected or self.busy:
+        if not self.connected or self.stopping:
+            return False
+        if self.busy:
+            if kind == "force_close" and self.action_origin is not None:
+                self.pending_force_close = (origin, args)
+                return True
             return False
         self.action_origin = origin
         self.busy_changed.emit(True)
@@ -125,6 +138,9 @@ class DashboardController(QObject):
         self.busy_changed.emit(self.busy)
         if origin is not None:
             origin.action_finished(success, message)
+        pending, self.pending_force_close = self.pending_force_close, None
+        if pending is not None:
+            self.action(pending[0], "force_close", *pending[1])
 
     def task(self, function, callback):
         """Internal work only; never accepts executable content from the IPC client."""
@@ -139,6 +155,7 @@ class DashboardController(QObject):
             return
         self.stopping = True
         self.busy_changed.emit(True)
+        self.attention.close()
         self.browser_tabs.close()
         self.backend.stop()
         self._await_stop()

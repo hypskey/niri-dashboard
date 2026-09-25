@@ -165,7 +165,8 @@ class Icons:
         if app_id in self.cache:
             return self.cache[app_id]
         label, name = self.entries.get(app_id.lower(), (app_id.rsplit(".", 1)[-1], app_id))
-        target = self.appearance.settings.icon_size if self.appearance else 38
+        target = (self.appearance.settings.scaled(self.appearance.settings.icon_size)
+                  if self.appearance else 38)
         icon_path = self._theme_icon_path(name, target)
         icon = QIcon(icon_path) if icon_path else (QIcon(name) if Path(name).is_absolute() else QIcon.fromTheme(name))
         if icon.isNull():
@@ -193,7 +194,8 @@ class Icons:
 
     def _site_icon(self, site):
         if site not in self.site_icons:
-            target = self.appearance.settings.icon_size if self.appearance else 38
+            target = (self.appearance.settings.scaled(self.appearance.settings.icon_size)
+                      if self.appearance else 38)
             icon = None
             for name in SITE_ICON_NAMES[site]:
                 path = self._theme_icon_path(name, target)
@@ -223,7 +225,8 @@ class Icons:
         # A manual asset can be replaced while the dashboard is running. Drop
         # only the corresponding rendered card cache so it is not kept stale.
         self.pixmaps = {key: value for key, value in self.pixmaps.items() if key[2] != icon_id}
-        target = self.appearance.settings.icon_size if self.appearance else 38
+        target = (self.appearance.settings.scaled(self.appearance.settings.icon_size)
+                  if self.appearance else 38)
         icon = None
         if entry.asset_path and entry.asset_path.is_file():
             icon = QIcon(str(entry.asset_path))

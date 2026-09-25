@@ -1,26 +1,46 @@
 """A mouse-operated graph of monitor branches, workspace rows and app nodes."""
 import math
-from PySide6.QtCore import QPointF, QRectF, Qt, Signal, QTimer, QElapsedTimer
-from PySide6.QtGui import QColor, QFont, QPainter, QPainterPath, QPen, QCursor, QLinearGradient, QTransform
-from PySide6.QtWidgets import QApplication, QGraphicsLineItem, QGraphicsItem, QGraphicsObject, QGraphicsRectItem, QGraphicsScene, QGraphicsView
+from PySide6.QtCore import (QEasingCurve, QElapsedTimer, QPoint, QPointF,
+                            QPropertyAnimation, QRectF, Qt, Signal, QTimer)
+from PySide6.QtGui import (QColor, QFont, QInputDevice,
+                           QLinearGradient, QPainter, QPainterPath, QPen,
+                           QTransform)
+from PySide6.QtWidgets import QApplication, QGraphicsItem, QGraphicsLineItem, QGraphicsObject, QGraphicsRectItem, QGraphicsScene, QGraphicsView
 from .appearance import DEFAULT_PALETTE, DashboardSettings
 from .hints import HintAssignments
 from .focus_path import FocusPath
 from .niri import ordered, position
+from .pet import PET_HEIGHT, PetGraphicsItem
 
 BG = DEFAULT_PALETTE.dashboard_background
 TEXT = DEFAULT_PALETTE.primary_text
 MUTED = DEFAULT_PALETTE.secondary_text
 COLORS = list(DEFAULT_PALETTE.pipe_colors)
 NODE_W, NODE_H, STEP, ROW = 108, 100, 136, 144
+MAX_MANUAL_ZOOM = 1.5
+MOUSE_DRAG_THRESHOLD = 12
+TOUCH_DRAG_THRESHOLD = 22
+FORCE_CLOSE_DOUBLE_TAP_MS = 600
+# The dedicated dashboard display is intentionally absent from the desktop
+# topology. This becomes a user-configurable output list in a later iteration.
+HIDDEN_DASHBOARD_OUTPUTS = frozenset({"HDMI-A-5"})
 
 
 def font(size, bold=False, settings=None):
     settings = settings or DashboardSettings()
-    return QFont(settings.font_family, size, QFont.Weight.DemiBold if bold else QFont.Weight.Normal)
+    return QFont(settings.font_family, settings.scaled(size),
+                 QFont.Weight.DemiBold if bold else QFont.Weight.Normal)
 
 
 class AppNode(QGraphicsObject):
+    @staticmethod
+    def icon_circle_rect(settings):
+        icon_size = settings.scaled(settings.icon_size)
+        padding = settings.scaled_f(8)
+        left = (settings.scaled(settings.node_width) - icon_size) / 2 - padding
+        return QRectF(left, 0, icon_size + padding * 2,
+                      icon_size + padding * 2)
+
     def __init__(self, window, icons, color, hint=None, palette=None, settings=None):
         super().__init__()
         self.window = window
@@ -32,36 +52,48 @@ class AppNode(QGraphicsObject):
         self.hint = str(hint) if hint is not None else ""
         self.palette = palette or DEFAULT_PALETTE
         self.settings = settings or DashboardSettings()
-        self.width = self.settings.node_width
-        self.height = self.settings.node_height
+        self.width = self.settings.scaled(self.settings.node_width)
+        self.height = self.settings.scaled(self.settings.node_height)
         self.hovered = False
+        self.pressed_feedback = False
+        self.feedback_animation = None
         self.setAcceptHoverEvents(True)
         self.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setZValue(5)
+        self.setTransformOriginPoint(self.width / 2, self.height / 2)
         pos = position(window)
         detail = "Floating · dropping inserts into tiling" if window.get("is_floating") else f"Column {pos[0]}, row {pos[1]}" if pos else "Position unavailable"
         self.setToolTip(f"{self.label}\n{window.get('title') or 'Untitled window'}\n{detail}\nDrag to a workspace or between apps")
 
     def boundingRect(self):
-        return QRectF(-3, -3, self.width + 6, self.height + 6)
+        edge = self.settings.scaled_f(3)
+        return QRectF(-edge, -edge, self.width + edge * 2,
+                      self.height + edge * 2)
 
     def paint(self, p, option, widget=None):
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         focused = self.window.get("is_focused")
-        icon_size = self.settings.icon_size
-        icon_x = (self.width - icon_size) / 2
+        s = self.settings.scaled
+        sf = self.settings.scaled_f
+        icon_size = s(self.settings.icon_size)
+        circle = self.icon_circle_rect(self.settings)
+        icon_x = circle.left() + sf(8)
         p.setFont(font(self.settings.hint_badge_font_size, True, self.settings))
-        badge_width = max(20, p.fontMetrics().horizontalAdvance(self.hint) + 10)
-        badge_rect = QRectF(self.width - badge_width, 0, badge_width, 20)
-        base = QColor(self.palette.focused_background if focused else self.palette.node_background)
+        badge_height = s(20)
+        badge_width = max(s(20), p.fontMetrics().horizontalAdvance(self.hint) + s(10))
+        badge_rect = QRectF(self.width - badge_width, 0, badge_width, badge_height)
+        base = QColor(self.palette.focused_background
+                      if focused or self.pressed_feedback
+                      else self.palette.node_background)
         gradient = QLinearGradient(icon_x, 0, icon_x + icon_size, icon_size)
         gradient.setColorAt(0, base.lighter(108))
         gradient.setColorAt(1, base.darker(108))
         p.setBrush(gradient)
         border = self.palette.focused_border if focused or self.hovered else self.palette.node_border
-        p.setPen(QPen(QColor(border), 2 if focused else 1))
-        p.drawEllipse(QRectF(icon_x - 8, 0, icon_size + 16, icon_size + 16))
+        p.setPen(QPen(QColor(border),
+                      sf(2 if focused or self.pressed_feedback else 1)))
+        p.drawEllipse(circle)
         p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
         pixmap = self.icons.rendered(
             self.window.get("app_id"), icon_size, self.window.get("title"),
@@ -69,27 +101,34 @@ class AppNode(QGraphicsObject):
         if not pixmap.isNull():
             pixmap_size = pixmap.deviceIndependentSize()
             px = icon_x + (icon_size - pixmap_size.width()) / 2
-            py = 8 + (icon_size - pixmap_size.height()) / 2
+            py = sf(8) + (icon_size - pixmap_size.height()) / 2
             p.drawPixmap(QPointF(px, py), pixmap)
         p.setFont(font(self.settings.application_title_size, True, self.settings))
         p.setPen(QColor(self.palette.focused_text if focused else self.palette.application_title))
-        label = p.fontMetrics().elidedText(self.label, Qt.TextElideMode.ElideRight, self.width - 12)
-        p.drawText(QRectF(6, icon_size + 18, self.width - 12, 18), Qt.AlignmentFlag.AlignCenter, label)
+        label = p.fontMetrics().elidedText(
+            self.label, Qt.TextElideMode.ElideRight, self.width - s(12))
+        p.drawText(QRectF(s(6), icon_size + s(18), self.width - s(12), s(18)),
+                   Qt.AlignmentFlag.AlignCenter, label)
         p.setFont(font(self.settings.window_title_size, settings=self.settings))
         p.setPen(QColor(self.palette.window_title))
-        title = p.fontMetrics().elidedText(self.window.get("title") or "Untitled", Qt.TextElideMode.ElideRight, self.width - 12)
-        p.drawText(QRectF(6, icon_size + 38, self.width - 12, 16), Qt.AlignmentFlag.AlignCenter, title)
+        title = p.fontMetrics().elidedText(
+            self.window.get("title") or "Untitled", Qt.TextElideMode.ElideRight,
+            self.width - s(12))
+        p.drawText(QRectF(s(6), icon_size + s(38), self.width - s(12), s(16)),
+                   Qt.AlignmentFlag.AlignCenter, title)
         if self.window.get("is_floating"):
             p.setPen(QColor(self.palette.secondary_text))
-            p.drawText(QRectF(2, 2, 18, 16), Qt.AlignmentFlag.AlignCenter, "~")
+            p.drawText(QRectF(s(2), s(2), s(18), s(16)),
+                       Qt.AlignmentFlag.AlignCenter, "~")
         if self.window.get("is_urgent"):
             p.setPen(Qt.PenStyle.NoPen)
             p.setBrush(QColor(self.palette.pipe_colors[2]))
-            p.drawEllipse(QPointF(self.width - 5, self.height - 5), 4, 4)
+            p.drawEllipse(QPointF(self.width - sf(5), self.height - sf(5)),
+                          sf(4), sf(4))
         if self.hint:
-            p.setPen(QPen(QColor(self.palette.hint_border), 1))
+            p.setPen(QPen(QColor(self.palette.hint_border), sf(1)))
             p.setBrush(QColor(self.palette.hint_background))
-            p.drawRoundedRect(badge_rect, 5, 5)
+            p.drawRoundedRect(badge_rect, sf(5), sf(5))
             p.setPen(QColor(self.palette.hint_text))
             p.drawText(badge_rect, Qt.AlignmentFlag.AlignCenter, self.hint)
 
@@ -101,19 +140,51 @@ class AppNode(QGraphicsObject):
         self.hovered = False
         self.update()
 
+    def set_pressed_feedback(self, pressed):
+        self.pressed_feedback = pressed
+        if pressed:
+            if self.feedback_animation is not None:
+                self.feedback_animation.stop()
+            self.setScale(1.035)
+        else:
+            self.setScale(1.0)
+        self.update()
+
+    def animate_click(self):
+        self.pressed_feedback = True
+        animation = QPropertyAnimation(self, b"scale", self)
+        animation.setDuration(170)
+        animation.setStartValue(1.035)
+        animation.setKeyValueAt(.55, .985)
+        animation.setEndValue(1.0)
+        animation.setEasingCurve(QEasingCurve.Type.OutCubic)
+        animation.finished.connect(self._finish_click_feedback)
+        self.feedback_animation = animation
+        animation.start(QPropertyAnimation.DeletionPolicy.DeleteWhenStopped)
+        self.update()
+
+    def _finish_click_feedback(self):
+        self.pressed_feedback = False
+        self.feedback_animation = None
+        self.setScale(1.0)
+        self.update()
+
 
 class GraphView(QGraphicsView):
     move_requested = Signal(int, int, object)
     focus_requested = Signal(int)
     close_requested = Signal(int)
+    force_close_requested = Signal(int)
     icon_picker_requested = Signal(int, object)
     escape_pressed = Signal()
     interaction_finished = Signal()
     hint = Signal(str)
     zoom_changed = Signal(int)
     numeric_pressed = Signal(str)
+    attention_dismiss_requested = Signal()
 
-    def __init__(self, icons, translucent=False, appearance=None, hint_assignments=None, background_opacity=1.0):
+    def __init__(self, icons, translucent=False, appearance=None, hint_assignments=None,
+                 background_opacity=1.0, show_pet=False):
         super().__init__()
         self.setScene(QGraphicsScene(self))
         self.icons = icons
@@ -125,20 +196,40 @@ class GraphView(QGraphicsView):
         self.settings = appearance.settings if appearance else DashboardSettings()
         self.hint_assignments = hint_assignments or HintAssignments()
         self.shared_hint_assignments = hint_assignments is not None
+        self.show_pet = show_pet
+        self.pet_item = None
+        self.pet_world_anchors = {}
+        self.pet_screen_anchors = {}
+        self.pet_focused_output = None
+        self.attention = None
         self.nodes = {}
         self.rows = []
         self.trailing_targets = []
         self.data = None
         self.pressed = None
+        self.close_candidate = None
+        self.close_press_point = None
+        self.close_is_touch = False
+        self.close_cancelled = False
+        self.close_force_candidate = False
+        self.close_sequence_window_id = None
+        self.close_sequence_timer = QElapsedTimer()
         self.dragging = False
         self.drag_scene_rect = None
         self.drag_transform = None
+        self.drag_center = None
+        self.drag_point = None
+        self.drag_auto_fit = None
+        self.drag_scene_expanded = False
+        self.press_is_touch = False
         self.panning = False
         self.busy = False
         self.connected = False
         self.drop = None
         self.marker = None
         self.auto_fit = True
+        self.default_transform = QTransform()
+        self.default_scale = None
         self.background_grid = True
         self.appearance_pending = False
         self.space = False
@@ -157,53 +248,32 @@ class GraphView(QGraphicsView):
             palette.setColor(palette.ColorRole.Window, QColor(0, 0, 0, 0))
             self.viewport().setPalette(palette)
         self.setFrameShape(QGraphicsView.Shape.NoFrame)
+        # Panning and edge scrolling still use the scrollbar values internally;
+        # hiding the chrome prevents temporary drag bounds from flashing bars.
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
         self.setResizeAnchor(QGraphicsView.ViewportAnchor.AnchorViewCenter)
         self.setMouseTracking(True)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.edge_timer = QTimer(self)
-        self.edge_timer.setInterval(16)
+        self.edge_timer.setInterval(33)
         self.edge_timer.timeout.connect(self.edge_pan)
         self.focus_path = None
-        self.flow_distance = 0.0
-        self.flow_clock = QElapsedTimer()
-        self.flow_timer = QTimer(self)
-        self.flow_timer.setInterval(33)
-        self.flow_timer.timeout.connect(self._animate_focus_path)
+        self.graph_bounds = QRectF()
         self.interaction_finished.connect(self._finish_appearance_update)
+        self.horizontalScrollBar().valueChanged.connect(self._sync_pet_overlay)
+        self.verticalScrollBar().valueChanged.connect(self._sync_pet_overlay)
 
-    def _sync_flow_timer(self):
-        running = self.isVisible() and self.focus_path is not None and self.settings.focus_path_flow
-        if running and not self.flow_timer.isActive():
-            self.flow_clock.start()
-            self.flow_timer.start()
-        elif not running:
-            self.flow_timer.stop()
-
-    def _animate_focus_path(self):
-        if self.focus_path is None:
-            self.flow_timer.stop()
-            return
-        seconds = self.flow_clock.nsecsElapsed() / 1_000_000_000
-        self.flow_clock.restart()
-        self.flow_distance = (self.flow_distance + seconds * FocusPath.SPEED *
-                              self.settings.focus_path_flow_speed) % FocusPath.PERIOD
-        self.focus_path.set_distance(self.flow_distance)
-        # QGraphicsItem.update(rect) merges an item's dirty rectangles into one
-        # large box. Submit the two route legs directly to the view instead.
-        self.updateScene(list(self.focus_path.dirty_rects))
-
-    def showEvent(self, event):
-        super().showEvent(event)
-        self._sync_flow_timer()
-
-    def hideEvent(self, event):
-        self.flow_timer.stop()
-        super().hideEvent(event)
+    def set_attention(self, cue):
+        self.attention = cue
+        if self.pet_item is not None:
+            self.pet_item.set_attention(cue)
 
     @property
     def interacting(self):
-        return self.pressed is not None or self.panning
+        return (self.pressed is not None or self.panning or
+                self.close_candidate is not None)
 
     def set_appearance(self):
         if self.appearance:
@@ -235,6 +305,7 @@ class GraphView(QGraphicsView):
         return item
 
     def line(self, x1, y1, x2, y2, color, width=2):
+        width = self.settings.scaled_f(width)
         pen = QPen(QColor(color), width)
         pen.setCapStyle(Qt.PenCapStyle.RoundCap)
         item = self.scene().addLine(x1, y1, x2, y2, pen)
@@ -250,22 +321,38 @@ class GraphView(QGraphicsView):
 
     def render(self, data):
         self.data = data
+        s = self.settings.scaled
+        sf = self.settings.scaled_f
+        ls = self.settings.layout_scaled
+        view_transform = QTransform(self.transform())
+        horizontal_scroll = self.horizontalScrollBar().value()
+        vertical_scroll = self.verticalScrollBar().value()
+        pet_item = self.pet_item if self.show_pet else None
+        if pet_item is not None and pet_item.scene() is self.scene():
+            self.scene().removeItem(pet_item)
         self.focus_path = None
+        self.pet_item = pet_item
         self.scene().clear()
         self.nodes = {}
         self.rows = []
         self.trailing_targets = []
         self.marker = None
         outputs = data["outputs"]
-        names = sorted([name for name, out in outputs.items() if out.get("logical")],
+        names = sorted([name for name, out in outputs.items()
+                        if out.get("logical") and
+                        name not in HIDDEN_DASHBOARD_OUTPUTS],
                        key=lambda name: (outputs[name]["logical"].get("x", 0), outputs[name]["logical"].get("y", 0)))
         # Preserve workspaces during output disconnects / compositor transitions.
         for ws in data["workspaces"]:
-            if ws.get("output") not in names:
+            if (ws.get("output") not in names and
+                    ws.get("output") not in HIDDEN_DASHBOARD_OUTPUTS):
                 names.append(ws.get("output"))
         if not names:
-            self.text("Your desktop will appear here", 20, 20, self.settings.output_label_size, self.colors.primary_text, True)
-            self.text("Waiting for an active monitor and its workspaces.", 20, 60, self.settings.normal_text_size, self.colors.secondary_text)
+            self.text("Your desktop will appear here", ls(20), ls(20),
+                      self.settings.output_label_size, self.colors.primary_text, True)
+            self.text("Waiting for an active monitor and its workspaces.",
+                      ls(20), ls(60), self.settings.normal_text_size,
+                      self.colors.secondary_text)
         branches = []
         ordered_window_ids = []
         for name in names:
@@ -283,48 +370,94 @@ class GraphView(QGraphicsView):
             branches.append((name, workspaces, groups, trailing_workspace))
         hint_by_id = (dict(self.hint_assignments.by_window) if self.shared_hint_assignments
                       else self.hint_assignments.update(ordered_window_ids))
-        x = self.settings.graph_padding
+        x = 0
         focused_window = next((window for window in data["windows"] if window.get("is_focused")), None)
         focused_workspace_id = focused_window.get("workspace_id") if focused_window else None
+        focused_workspace = next(
+            (workspace for workspace in data["workspaces"]
+             if workspace.get("id") == focused_workspace_id), None)
+        focused_output = focused_workspace.get("output") if focused_workspace else None
+        pet_anchors = {}
         for branch, (name, workspaces, groups, trailing_workspace) in enumerate(branches):
             color = self.colors.neutral_pipe
-            step, row_height = self.settings.workspace_step, self.settings.workspace_row
-            width = max(self.settings.node_width + 262, 152 + max((len(w) for w in groups), default=0) * step)
-            self.line(x + 20, 67, x + 20, 114 + max(0, len(workspaces) - 1) * row_height + 27, color, 3)
-            self.text(f"{branch + 1:02d}  /  {name or 'Unassigned'}", x, 8, self.settings.output_label_size, self.colors.output_label, True)
+            node_width = s(self.settings.node_width)
+            node_height = s(self.settings.node_height)
+            circle = AppNode.icon_circle_rect(self.settings)
+            circle_y = circle.center().y()
+            step = max(ls(self.settings.workspace_step), node_width + ls(28))
+            row_height = max(ls(self.settings.workspace_row), node_height + ls(44))
+            width = max(node_width + ls(262),
+                        ls(152) + max((len(w) for w in groups), default=0) * step)
+            trunk_x = x + ls(20)
+            if self.show_pet:
+                pet_anchors[name] = QPointF(
+                    x + ls(4), ls(4) - sf(PET_HEIGHT))
+            self.line(trunk_x, ls(67), trunk_x,
+                      ls(114) + max(0, len(workspaces) - 1) * row_height + circle_y,
+                      color, 3)
+            self.text(f"{branch + 1:02d}  /  {name or 'Unassigned'}",
+                      x, ls(8), self.settings.output_label_size,
+                      self.colors.output_label, True)
             model = outputs.get(name, {}).get("model") or "Workspace branch"
-            self.text(f"{model}  ·  {len(workspaces)} workspaces", x, 38, self.settings.normal_text_size, self.colors.secondary_text)
+            self.text(f"{model}  ·  {len(workspaces)} workspaces", x, ls(38),
+                      self.settings.normal_text_size, self.colors.secondary_text)
             for row, (ws, windows) in enumerate(zip(workspaces, groups)):
-                y = 114 + row * row_height
-                self.line(x + 20, y + 27, x + 137, y + 27, color)
-                dot_fill = color if ws.get("is_active") else self.colors.dashboard_background
-                dot = self.scene().addEllipse(x + 14, y + 21, 12, 12, QPen(QColor(color), 2), QColor(dot_fill))
+                y = ls(114) + row * row_height
+                branch_y = y + circle_y
+                start = x + ls(110)
+                self.line(trunk_x, branch_y, start + circle.left(), branch_y, color)
+                dot_fill = (color if ws.get("is_active")
+                            else self.colors.dashboard_background)
+                dot_size = s(12)
+                dot = self.scene().addEllipse(
+                    trunk_x - dot_size / 2, branch_y - dot_size / 2,
+                    dot_size, dot_size,
+                    QPen(QColor(color), sf(2)), QColor(dot_fill))
                 dot.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
-                self.text(f"{ws['idx']:02d}", x - 4, y + 4, self.settings.workspace_number_size, self.colors.workspace_number, True)
-                start = x + 110
-                rect = QRectF(x + 45, y - 5, width - 45, self.settings.node_height + 15)
-                self.rows.append({"workspace": ws, "rect": rect, "start": start, "y": y, "windows": windows, "color": color})
+                number = self.text(f"{ws['idx']:02d}", 0, y + ls(4),
+                                   self.settings.workspace_number_size,
+                                   self.colors.workspace_number, True)
+                number.setX(trunk_x - dot_size / 2 - ls(8) -
+                            number.boundingRect().width())
+                rect = QRectF(x + ls(45), y - ls(5), width - ls(45),
+                              node_height + s(15))
+                self.rows.append({"workspace": ws, "rect": rect,
+                                  "hit_rect": rect.adjusted(
+                                      0, -s(8), 0, s(8)),
+                                  "start": start, "y": y, "windows": windows,
+                                  "color": color, "step": step,
+                                  "node_width": node_width,
+                                  "node_height": node_height})
                 if not windows:
-                    placeholder_size = min(54, self.settings.icon_size + 16)
-                    placeholder = self.scene().addEllipse(QRectF(start + 27, y, placeholder_size, placeholder_size), QPen(QColor(color), 1, Qt.PenStyle.DashLine))
+                    placeholder_size = min(s(54), s(self.settings.icon_size) + s(16))
+                    placeholder_rect = QRectF(
+                        start + circle.left(), branch_y - placeholder_size / 2,
+                        placeholder_size, placeholder_size)
+                    placeholder = self.scene().addEllipse(
+                        placeholder_rect,
+                        QPen(QColor(color), sf(1), Qt.PenStyle.DashLine))
                     placeholder.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
                     plus = self.text("+", start, y, 22, self.colors.secondary_text)
-                    plus.setPos(start + placeholder_size - plus.boundingRect().width() / 2, y + placeholder_size / 2 - plus.boundingRect().height() / 2)
+                    plus_bounds = plus.boundingRect()
+                    plus.setPos(
+                        placeholder_rect.center().x() - plus_bounds.width() / 2,
+                        placeholder_rect.center().y() - plus_bounds.height() / 2 -
+                        sf(1.5))
                 for index, window in enumerate(windows):
                     nx = start + index * step
                     if index:
-                        self.line(nx - step + self.settings.node_width - 27, y + 27, nx + 27, y + 27, color)
+                        self.line(nx - step + circle.right(), branch_y,
+                                  nx + circle.left(), branch_y, color)
                     node = AppNode(window, self.icons, color, hint_by_id.get(window["id"]), self.colors, self.settings)
-                    if self.settings.focus_path_flow:
-                        # Flow repaints run behind cards: reuse their sharp device-
-                        # scale rendering until hover/state/transform invalidates it.
-                        node.setCacheMode(QGraphicsItem.CacheMode.DeviceCoordinateCache)
                     node.setPos(nx, y)
                     self.scene().addItem(node)
                     self.nodes[window["id"]] = node
                     pos = position(window)
                     if pos and sum(bool(position(w)) and position(w)[0] == pos[0] for w in windows) > 1:
-                        self.text(f"STACK {pos[0]} · {pos[1]}", nx + 15, y + self.settings.node_height + 4, max(6, self.settings.normal_text_size - 2), self.colors.secondary_text)
+                        self.text(f"STACK {pos[0]} · {pos[1]}", nx + ls(15),
+                                  y + node_height + ls(4),
+                                  max(6, self.settings.normal_text_size - 2),
+                                  self.colors.secondary_text)
             focus_row = next((index for index, ws in enumerate(workspaces)
                               if ws["id"] == focused_workspace_id), None)
             if focus_row is not None:
@@ -333,29 +466,76 @@ class GraphView(QGraphicsView):
                                     if window["id"] == focused_window["id"]), None)
                 if focus_index is not None:
                     accent = self.colors.focused_route
-                    focus_y = 114 + focus_row * row_height + 27
+                    focus_y = ls(114) + focus_row * row_height + circle_y
                     # Keep the same root, junctions and destination. Intermediate
                     # cards mask the continuous path at their existing z-order.
                     self.focus_path = FocusPath(
-                        QPointF(x + 20, 67),
-                        [QPointF(x + 20, 114 + row * row_height + 27)
+                        QPointF(trunk_x, ls(67)),
+                        [QPointF(trunk_x, ls(114) + row * row_height + circle_y)
                          for row in range(focus_row + 1)],
-                        QPointF(x + 137 + focus_index * step, focus_y),
-                        accent, self.colors.dashboard_background, self.settings, self.flow_distance)
+                        QPointF(start + circle.left() + focus_index * step, focus_y),
+                        accent, self.colors.dashboard_background, self.settings)
                     self.scene().addItem(self.focus_path)
             if trailing_workspace and workspaces:
-                target_y = 114 + len(workspaces) * row_height - 20
+                target_y = ls(114) + len(workspaces) * row_height - ls(20)
+                target_rect = QRectF(
+                    x + ls(45), target_y, width - ls(45),
+                    max(s(72), node_height))
                 self.trailing_targets.append({
                     "workspace": trailing_workspace,
-                    "rect": QRectF(x + 45, target_y, width - 45, max(72, self.settings.node_height)),
+                    "rect": target_rect,
+                    "hit_rect": target_rect.adjusted(
+                        -s(8), -s(10), s(8), s(12)),
                     "output": name,
                 })
-            x += width + self.settings.branch_gap
-        padding = self.settings.graph_padding
-        self.scene().setSceneRect(self.scene().itemsBoundingRect().adjusted(-padding, -padding, padding + 30, padding + 30))
-        if self.auto_fit and not self.dragging:
+            x += width + ls(self.settings.branch_gap)
+        if self.show_pet and names:
+            if self.pet_item is None:
+                self.pet_item = PetGraphicsItem(
+                    self.colors.focused_route,
+                    self.colors.dashboard_background)
+                self.pet_item.setFlag(
+                    QGraphicsItem.GraphicsItemFlag.ItemIgnoresTransformations, True)
+            self.pet_item.set_ui_scale(self.settings.global_scale)
+            self.scene().addItem(self.pet_item)
+            self.pet_item.set_hud_colors(
+                self.colors.focused_route,
+                self.colors.dashboard_background,
+                self.colors.primary_text)
+            self.pet_item.set_attention(self.attention)
+        self.pet_world_anchors = pet_anchors
+        self.pet_focused_output = focused_output
+        padding = ls(self.settings.graph_padding)
+        pet_in_scene = (self.pet_item is not None and
+                        self.pet_item.scene() is self.scene())
+        if pet_in_scene:
+            self.scene().removeItem(self.pet_item)
+        focus_in_scene = self.focus_path is not None and self.focus_path.scene() is self.scene()
+        if focus_in_scene:
+            self.scene().removeItem(self.focus_path)
+        self.graph_bounds = self.scene().itemsBoundingRect()
+        if focus_in_scene:
+            self.scene().addItem(self.focus_path)
+        if pet_in_scene:
+            self.scene().addItem(self.pet_item)
+        next_rect = self.graph_bounds.adjusted(-padding, -padding, padding, padding)
+        layout_changed = next_rect != self.sceneRect()
+        self.scene().setSceneRect(next_rect)
+        if self.dragging:
+            self.setTransform(view_transform)
+            self.horizontalScrollBar().setValue(horizontal_scroll)
+            self.verticalScrollBar().setValue(vertical_scroll)
+        elif layout_changed and self.auto_fit:
             self.fit_graph()
-        self._sync_flow_timer()
+        else:
+            self.setTransform(view_transform)
+            self.horizontalScrollBar().setValue(horizontal_scroll)
+            self.verticalScrollBar().setValue(vertical_scroll)
+        if layout_changed or self.pet_screen_anchors.keys() != pet_anchors.keys():
+            self._place_pet_over_outputs()
+        else:
+            self._sync_pet_overlay()
+        self.update_pet_dock_anchor()
 
     @property
     def hint_targets(self):
@@ -365,32 +545,125 @@ class GraphView(QGraphicsView):
         if self.dragging:
             return
         self.auto_fit = True
-        self.fitInView(self.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio)
-        if self.transform().m11() > 1.3:
-            self.resetTransform()
-            self.scale(1.3, 1.3)
-        self.zoom_changed.emit(round(self.transform().m11() * 100))
+        # Always derive the default from an identity transform.  This makes
+        # fitting idempotent after wheel zoom and prevents refreshes/actions
+        # from accumulating scale around the mouse cursor.
+        anchor = self.transformationAnchor()
+        self.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorViewCenter)
+        self.resetTransform()
+        bounds = self.sceneRect()
+        if not bounds.isEmpty():
+            # Scene bounds contain only graph geometry and symmetric padding.
+            scale = min(1.0,
+                        max(1, self.viewport().width() - 2) / bounds.width(),
+                        max(1, self.viewport().height() - 2) / bounds.height())
+            self.scale(scale, scale)
+        self.centerOn(self.sceneRect().center())
+        self.setTransformationAnchor(anchor)
+        self.default_transform = QTransform(self.transform())
+        self.default_scale = self.transform().m11()
+        self.zoom_changed.emit(100)
+        self._place_pet_over_outputs()
+        self.update_pet_dock_anchor()
+
+    def _place_pet_over_outputs(self):
+        """Project graph-relative monitor positions into the screen overlay layer."""
+        if self.pet_item is None:
+            return
+        width = self.pet_item.scaled_motion_rect().width()
+        margin = self.settings.scaled(8)
+        self.pet_screen_anchors = {}
+        for name, world in self.pet_world_anchors.items():
+            point = self.mapFromScene(world)
+            self.pet_screen_anchors[name] = QPoint(
+                max(margin, min(point.x(), self.viewport().width() - width - margin)),
+                max(margin, point.y()))
+        self._sync_pet_overlay()
+
+    def _sync_pet_overlay(self):
+        if self.pet_item is None or self.pet_item.scene() is not self.scene():
+            return
+        anchors = {name: self.mapToScene(point)
+                   for name, point in self.pet_screen_anchors.items()}
+        self.pet_item.set_output_anchors(anchors, self.pet_focused_output)
+        self.update_pet_dock_anchor()
+
+    def update_pet_dock_anchor(self):
+        if getattr(self, "pet_item", None) is None or self.viewport().width() <= 0:
+            return
+        # Pet artwork ignores the graph transform; its dimensions here are
+        # device pixels. The speech bubble does not affect its dock position.
+        pet_corner = self.pet_item.scaled_motion_rect().bottomRight()
+        point = QPoint(
+            round(self.viewport().width() - self.settings.scaled(14) - pet_corner.x()),
+            round(self.viewport().height() - self.settings.scaled(10) - pet_corner.y()))
+        self.pet_item.set_dock_anchor(self.mapToScene(point))
 
     def zoom(self, factor):
         if self.dragging:
             return
-        value = self.transform().m11() * factor
-        if 0.12 <= value <= 2.5:
-            self.auto_fit = False
-            self.scale(factor, factor)
-            self.zoom_changed.emit(round(value * 100))
+        if self.default_scale is None:
+            self.fit_graph()
+        current = self.transform().m11()
+        minimum = self.default_scale or current
+        maximum = minimum * MAX_MANUAL_ZOOM
+        target = max(minimum, min(maximum, current * factor))
+        if math.isclose(target, current, rel_tol=1e-9, abs_tol=1e-9):
+            return
+        if math.isclose(target, minimum, rel_tol=1e-9, abs_tol=1e-9):
+            self.fit_graph()
+            return
+        self.auto_fit = False
+        self.scale(target / current, target / current)
+        self.zoom_changed.emit(round(target / minimum * 100))
+        self._sync_pet_overlay()
+        self.update_pet_dock_anchor()
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
         if self.auto_fit and not self.dragging:
             self.fit_graph()
+        else:
+            self._sync_pet_overlay()
+            self.update_pet_dock_anchor()
 
     def wheelEvent(self, event):
         self.zoom(1.15 if event.angleDelta().y() > 0 else 1 / 1.15)
         event.accept()
 
+    def mouseDoubleClickEvent(self, event):
+        point = event.position().toPoint()
+        if (event.button() == Qt.MouseButton.LeftButton and
+                (event.modifiers() | QApplication.keyboardModifiers()) &
+                Qt.KeyboardModifier.ControlModifier):
+            if self.node_at(point) is not None:
+                self.mousePressEvent(event)
+            else:
+                event.accept()
+            return
+        pet_hit = (self.pet_item is not None and
+                   self.pet_item in self.items(point))
+        if (event.button() == Qt.MouseButton.LeftButton and
+                self.node_at(point) is None and not pet_hit):
+            self.fit_graph()
+            event.accept()
+            return
+        super().mouseDoubleClickEvent(event)
+
     def node_at(self, pos):
         return next((item for item in self.items(pos) if isinstance(item, AppNode)), None)
+
+    @staticmethod
+    def _is_touch_event(event):
+        device = event.pointingDevice()
+        return (event.source() != Qt.MouseEventSource.MouseEventNotSynthesized or
+                (device is not None and
+                 device.type() == QInputDevice.DeviceType.TouchScreen))
+
+    def drag_threshold(self):
+        threshold = (TOUCH_DRAG_THRESHOLD if self.press_is_touch
+                     else MOUSE_DRAG_THRESHOLD)
+        return max(QApplication.startDragDistance(), threshold)
 
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.RightButton:
@@ -410,19 +683,62 @@ class GraphView(QGraphicsView):
             self.setCursor(Qt.CursorShape.ClosedHandCursor)
             event.accept()
             return
+        if (event.button() == Qt.MouseButton.LeftButton and
+                (event.modifiers() | QApplication.keyboardModifiers()) &
+                Qt.KeyboardModifier.AltModifier):
+            node = self.node_at(event.position().toPoint())
+            if node and not self.interacting:
+                self.icon_picker_requested.emit(
+                    node.window["id"],
+                    self.viewport().mapToGlobal(event.position().toPoint()))
+                event.accept()
+                return
+        if (event.button() == Qt.MouseButton.LeftButton and not self.space and
+                self.pet_item is not None and
+                self.pet_item in self.items(event.position().toPoint())):
+            if self.pet_item.attention_active:
+                self.attention_dismiss_requested.emit()
+                event.accept()
+                return
+            if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
+                self.pet_item.toggle_focus_session()
+            else:
+                self.update_pet_dock_anchor()
+                self.pet_item.toggle_dock()
+            event.accept()
+            return
         if event.button() == Qt.MouseButton.LeftButton and self.space:
             self.panning = True
             self.pan_start = event.position().toPoint()
             self.setCursor(Qt.CursorShape.ClosedHandCursor)
             event.accept()
             return
+        if (event.button() == Qt.MouseButton.LeftButton and
+                (event.modifiers() | QApplication.keyboardModifiers()) &
+                Qt.KeyboardModifier.ControlModifier):
+            node = self.node_at(event.position().toPoint())
+            if node and not self.interacting:
+                repeated = (self.close_sequence_window_id == node.window["id"] and
+                            self.close_sequence_timer.isValid() and
+                            self.close_sequence_timer.elapsed() <= FORCE_CLOSE_DOUBLE_TAP_MS)
+                if self.connected and (not self.busy or repeated):
+                    self.close_candidate = node
+                    self.close_press_point = event.position().toPoint()
+                    self.close_is_touch = self._is_touch_event(event)
+                    self.close_cancelled = False
+                    self.close_force_candidate = repeated
+                    node.set_pressed_feedback(True)
+                event.accept()
+                return
         if event.button() == Qt.MouseButton.LeftButton:
             node = self.node_at(event.position().toPoint())
             if node and self.connected and not self.busy:
                 self.pressed = node
+                self.press_is_touch = self._is_touch_event(event)
                 self.press_point = event.position().toPoint()
                 self.origin = QPointF(node.pos())
                 self.offset = self.mapToScene(self.press_point) - node.pos()
+                node.set_pressed_feedback(True)
                 event.accept()
                 return
             if not node:
@@ -434,18 +750,35 @@ class GraphView(QGraphicsView):
 
     def mouseMoveEvent(self, event):
         point = event.position().toPoint()
+        if self.close_candidate is not None:
+            threshold = (TOUCH_DRAG_THRESHOLD if self.close_is_touch
+                         else MOUSE_DRAG_THRESHOLD)
+            if ((point - self.close_press_point).manhattanLength() >=
+                    max(QApplication.startDragDistance(), threshold)):
+                self.close_cancelled = True
+                self.close_candidate.set_pressed_feedback(False)
+            event.accept()
+            return
         if self.panning:
             delta = point - self.pan_start
             self.pan_start = point
             self.auto_fit = False
             self.horizontalScrollBar().setValue(self.horizontalScrollBar().value() - delta.x())
             self.verticalScrollBar().setValue(self.verticalScrollBar().value() - delta.y())
+            self.update_pet_dock_anchor()
             return
         if self.pressed:
-            if not self.dragging and (point - self.press_point).manhattanLength() >= QApplication.startDragDistance():
+            if (not self.dragging and
+                    (point - self.press_point).manhattanLength() >=
+                    self.drag_threshold()):
                 self.dragging = True
                 self.drag_scene_rect = QRectF(self.sceneRect())
                 self.drag_transform = QTransform(self.transform())
+                self.drag_center = self.mapToScene(
+                    self.viewport().rect().center())
+                self.drag_auto_fit = self.auto_fit
+                self.drag_scene_expanded = False
+                self.pressed.set_pressed_feedback(False)
                 self.pressed.setZValue(50)
                 self.pressed.setOpacity(0.85)
                 self.edge_timer.start()
@@ -455,18 +788,29 @@ class GraphView(QGraphicsView):
         super().mouseMoveEvent(event)
 
     def update_drag(self, point):
+        self.drag_point = QPoint(point)
         scene_pos = self.mapToScene(point)
         self.pressed.setPos(scene_pos - self.offset)
+        base_scene_rect = (QRectF(self.drag_scene_rect)
+                           if self.drag_scene_rect is not None
+                           else QRectF(self.sceneRect()))
+        desired_scene_rect = base_scene_rect
         self.drop = None
         if self.marker:
             self.scene().removeItem(self.marker)
             self.marker = None
         for row in self.rows:
-            if not row["rect"].contains(scene_pos):
+            if not row["hit_rect"].contains(scene_pos):
                 continue
             # Anchors use original node coordinates, even while the dragged node moves.
-            candidates = [(i, w) for i, w in enumerate(row["windows"]) if w["id"] != self.pressed.window["id"]]
-            before = next(((i, w) for i, w in candidates if scene_pos.x() < row["start"] + i * self.settings.workspace_step + self.settings.node_width / 2), None)
+            # Re-index the remaining cards after removing the dragged one.  Using
+            # their old positions leaves a phantom gap on same-row reorders.
+            candidates = list(enumerate(
+                w for w in row["windows"]
+                if w["id"] != self.pressed.window["id"]))
+            before = next(((i, w) for i, w in candidates
+                           if scene_pos.x() < row["start"] + i * row["step"] +
+                           row["node_width"] / 2), None)
             if before and position(before[1]):
                 # A tiled insertion is between columns, never inside an existing stack.
                 column = position(before[1])[0]
@@ -476,8 +820,14 @@ class GraphView(QGraphicsView):
                 before = None
             anchor = before[1]["id"] if before else None
             self.drop = row["workspace"]["id"], anchor
-            mx = row["start"] + (before[0] * self.settings.workspace_step if before else len(row["windows"]) * self.settings.workspace_step) - 14
-            self.marker = self.line(mx, row["y"] - 5, mx, row["y"] + self.settings.node_height + 5, row["color"], 4)
+            mx = (row["start"] +
+                  (before[0] * row["step"] if before
+                   else len(candidates) * row["step"]) -
+                  self.settings.scaled(14))
+            self.marker = self.line(
+                mx, row["y"] - self.settings.scaled(5), mx,
+                row["y"] + row["node_height"] + self.settings.scaled(5),
+                row["color"], 4)
             self.marker.setZValue(40)
             destination = f"{row['workspace']['idx']:02d}"
             where = f"before {self.icons.resolve(before[1].get('app_id'))[0]}" if before else "at the end"
@@ -485,44 +835,82 @@ class GraphView(QGraphicsView):
             break
         if self.drop is None:
             for target in self.trailing_targets:
-                if not target["rect"].contains(scene_pos):
+                if not target["hit_rect"].contains(scene_pos):
                     continue
                 self.drop = target["workspace"]["id"], None
-                self.marker = QGraphicsRectItem(target["rect"])
-                self.marker.setPen(QPen(QColor(self.colors.focused_route), 2, Qt.PenStyle.DashLine))
-                self.marker.setBrush(QColor(self.colors.node_background))
+                rect = target["rect"]
+                self.marker = QGraphicsRectItem(
+                    QRectF(0, 0, rect.width(), rect.height()))
+                self.marker.setPos(rect.topLeft())
+                self.marker.setPen(QPen(
+                    QColor(self.colors.focused_route),
+                    self.settings.scaled_f(2), Qt.PenStyle.DashLine))
+                fill = QColor(self.colors.node_background)
+                fill.setAlpha(225)
+                self.marker.setBrush(fill)
                 self.marker.setZValue(40)
                 self.marker.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
                 self.scene().addItem(self.marker)
                 label = self.text("+ Create workspace", 0, 0, self.settings.normal_text_size,
                                   self.colors.focused_route, True)
                 label.setParentItem(self.marker)
-                label.setPos((target["rect"].width() - label.boundingRect().width()) / 2,
-                             (target["rect"].height() - label.boundingRect().height()) / 2)
-                self.scene().setSceneRect(self.sceneRect().united(target["rect"]).adjusted(-8, -8, 8, 8))
+                label.setPos((rect.width() - label.boundingRect().width()) / 2,
+                             (rect.height() - label.boundingRect().height()) / 2)
+                margin = self.settings.scaled(8)
+                desired_scene_rect = base_scene_rect.united(
+                    rect.adjusted(-margin, -margin, margin, margin))
                 self.hint.emit(f"Move to {target['output'] or 'unassigned'} / create workspace")
                 break
+        if self.dragging and self.sceneRect() != desired_scene_rect:
+            # Extending the scene for the temporary target must not move the
+            # camera.  Always derive it from the pre-drag bounds, then preserve
+            # the current center (including any deliberate edge pan).
+            center = self.mapToScene(self.viewport().rect().center())
+            transform = QTransform(self.transform())
+            self.scene().setSceneRect(desired_scene_rect)
+            self.setTransform(transform)
+            self.centerOn(center)
+        self.drag_scene_expanded = desired_scene_rect != base_scene_rect
         if self.drop is None:
             self.hint.emit("Drop on a workspace row · Esc cancels")
 
     def edge_pan(self):
-        if not self.dragging:
+        if not self.dragging or self.drag_point is None:
             return
-        point = self.viewport().mapFromGlobal(QCursor.pos())
+        point = self.drag_point
+        moved = False
         for value, limit, bar in [(point.x(), self.viewport().width(), self.horizontalScrollBar()), (point.y(), self.viewport().height(), self.verticalScrollBar())]:
-            delta = -12 if value < 40 else 12 if value > limit - 40 else 0
+            edge = self.settings.scaled(40)
+            speed = self.settings.scaled(8)
+            delta = -speed if value < edge else speed if value > limit - edge else 0
             if delta:
-                self.auto_fit = False
+                before = bar.value()
                 bar.setValue(bar.value() + delta)
+                moved = moved or bar.value() != before
+        if not moved:
+            return
+        self.auto_fit = False
+        self.update_pet_dock_anchor()
         self.update_drag(point)
 
     def cancel_drag(self):
         self.edge_timer.stop()
+        if self.close_candidate is not None:
+            self.close_candidate.set_pressed_feedback(False)
+            if self.close_force_candidate:
+                self.close_sequence_window_id = None
+                self.close_sequence_timer.invalidate()
+            self.close_candidate = None
+            self.close_press_point = None
+            self.close_is_touch = False
+            self.close_cancelled = False
+            self.close_force_candidate = False
         was_dragging = self.dragging
         if self.pressed:
             self.pressed.setPos(self.origin)
             self.pressed.setOpacity(1)
             self.pressed.setZValue(5)
+            self.pressed.set_pressed_feedback(False)
         if self.marker:
             self.scene().removeItem(self.marker)
             self.marker = None
@@ -530,8 +918,17 @@ class GraphView(QGraphicsView):
             self.scene().setSceneRect(self.drag_scene_rect)
             if self.drag_transform is not None:
                 self.setTransform(self.drag_transform)
+            if self.drag_center is not None:
+                self.centerOn(self.drag_center)
+            if self.drag_auto_fit is not None:
+                self.auto_fit = self.drag_auto_fit
         self.drag_scene_rect = None
         self.drag_transform = None
+        self.drag_center = None
+        self.drag_point = None
+        self.drag_auto_fit = None
+        self.drag_scene_expanded = False
+        self.press_is_touch = False
         self.pressed = None
         self.dragging = False
         self.drop = None
@@ -541,12 +938,40 @@ class GraphView(QGraphicsView):
         if event.button() == Qt.MouseButton.RightButton:
             event.accept()
             return
+        if event.button() == Qt.MouseButton.LeftButton and self.close_candidate is not None:
+            candidate = self.close_candidate
+            force = self.close_force_candidate
+            threshold = (TOUCH_DRAG_THRESHOLD if self.close_is_touch
+                         else MOUSE_DRAG_THRESHOLD)
+            should_close = (not self.close_cancelled and
+                            (event.position().toPoint() - self.close_press_point).manhattanLength() <
+                            max(QApplication.startDragDistance(), threshold) and
+                            self.node_at(event.position().toPoint()) is candidate and
+                            self.connected and (not self.busy or force))
+            self.cancel_drag()
+            if should_close:
+                candidate.animate_click()
+                if force:
+                    self.close_sequence_window_id = None
+                    self.close_sequence_timer.invalidate()
+                    self.force_close_requested.emit(candidate.window["id"])
+                else:
+                    self.close_sequence_window_id = candidate.window["id"]
+                    self.close_sequence_timer.start()
+                    self.close_requested.emit(candidate.window["id"])
+            elif force:
+                self.close_sequence_window_id = None
+                self.close_sequence_timer.invalidate()
+            self.interaction_finished.emit()
+            event.accept()
+            return
         if self.panning:
             self.panning = False
             self.unsetCursor()
             self.interaction_finished.emit()
             return
         if self.pressed:
+            clicked_node = self.pressed
             wid = self.pressed.window["id"]
             dragging, drop = self.dragging, self.drop
             self.cancel_drag()
@@ -554,6 +979,7 @@ class GraphView(QGraphicsView):
                 if dragging and drop:
                     self.move_requested.emit(wid, *drop)
                 elif not dragging:
+                    clicked_node.animate_click()
                     self.focus_requested.emit(wid)
             self.interaction_finished.emit()
             return
@@ -584,7 +1010,7 @@ class GraphView(QGraphicsView):
     def focusOutEvent(self, event):
         self.space = False
         self.panning = False
-        if self.pressed:
+        if self.pressed or self.close_candidate is not None:
             self.cancel_drag()
             self.interaction_finished.emit()
         super().focusOutEvent(event)
@@ -597,7 +1023,8 @@ class GraphView(QGraphicsView):
         grid_color = QColor(self.colors.secondary_text)
         grid_color.setAlpha(round(22 * self.background_opacity))
         p.setPen(QPen(grid_color, 1))
-        step = 28 if self.transform().m11() > 0.4 else 56
+        step = (self.settings.scaled(28) if self.transform().m11() > 0.4
+                else self.settings.scaled(56))
         for x in range(math.floor(rect.left() / step) * step, math.ceil(rect.right()), step):
             for y in range(math.floor(rect.top() / step) * step, math.ceil(rect.bottom()), step):
                 p.drawPoint(QPointF(x, y))

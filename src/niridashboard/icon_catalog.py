@@ -1,6 +1,7 @@
 """Small, local catalog of icons that can be assigned to individual windows."""
 from dataclasses import dataclass
 from pathlib import Path
+import re
 
 
 ICON_ASSET_DIRECTORY = Path(__file__).resolve().parents[2] / "assets" / "icons"
@@ -50,7 +51,7 @@ CATALOG = (
     CatalogIcon("ssh", "SSH", ("server", "remote", "terminal"), ("ssh", "network-server", "utilities-terminal"), "terminal.svg"),
     CatalogIcon("terminal", "Terminal", ("shell", "console", "kitty"), ("utilities-terminal", "terminal", "kitty"), "terminal.svg"),
     CatalogIcon("folder", "Folder / project", ("files", "directory", "project"), ("folder", "folder-visiting"), "folder.svg"),
-    CatalogIcon("nuke", "Nuke", ("compositing", "vfx", "foundry"), ("nuke",)),
+    CatalogIcon("nuke", "Nuke", ("compositing", "vfx", "foundry"), ("nuke",), "foundry-nuke.png"),
     CatalogIcon("firefox", "Firefox", ("browser", "web", "mozilla"), ("firefox", "firefox-icon"), "firefox.svg"),
     CatalogIcon("zen", "Zen Browser", ("browser", "web", "firefox"), ("zen-browser", "zen"), "zen.svg"),
 )
@@ -58,8 +59,40 @@ CATALOG = (
 
 class IconCatalog:
     def __init__(self, entries=CATALOG):
-        self.entries = tuple(entries)
+        self.base_entries = tuple(entries)
+        self.entries = self.base_entries
         self.by_id = {entry.id: entry for entry in self.entries}
+
+    def refresh_assets(self):
+        """Discover local artwork without replacing curated catalog entries."""
+        entries = list(self.base_entries)
+        by_id = {entry.id: entry for entry in entries}
+        used_assets = {entry.asset for entry in entries if entry.asset}
+        extensions = {".svg": 0, ".svgz": 1, ".png": 2,
+                      ".webp": 3, ".jpg": 4, ".jpeg": 5}
+        try:
+            files = [path for path in ICON_ASSET_DIRECTORY.rglob("*")
+                     if path.is_file() and path.suffix.lower() in extensions]
+        except OSError:
+            files = []
+        files.sort(key=lambda path: (path.relative_to(ICON_ASSET_DIRECTORY).with_suffix("").as_posix().casefold(),
+                                     extensions[path.suffix.lower()]))
+        for path in files:
+            relative = path.relative_to(ICON_ASSET_DIRECTORY)
+            if relative.as_posix() in used_assets:
+                continue
+            parts = [re.sub(r"[^a-z0-9]+", "-", part.casefold()).strip("-")
+                     for part in (*relative.parts[:-1], path.stem)]
+            icon_id = "-".join(part for part in parts if part)
+            if not icon_id or icon_id in by_id:
+                continue
+            name = re.sub(r"[-_]+", " ", path.stem).strip().title()
+            entry = CatalogIcon(icon_id, name, tuple(parts[:-1]), (path.stem,),
+                                relative.as_posix())
+            entries.append(entry)
+            by_id[icon_id] = entry
+        self.entries = tuple(entries)
+        self.by_id = by_id
 
     def get(self, icon_id):
         return self.by_id.get(icon_id)
@@ -74,3 +107,4 @@ class IconCatalog:
 
 
 DEFAULT_CATALOG = IconCatalog()
+DEFAULT_CATALOG.refresh_assets()

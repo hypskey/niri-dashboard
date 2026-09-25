@@ -41,7 +41,9 @@ class OverlayWindow(GraphWindow):
         layout.setContentsMargins(0, 0, 0, 0)
         self.error = QLabel()
         self.error.setWordWrap(True)
-        self.error.setStyleSheet(f"color: {controller.appearance.palette.error_text}; padding: 10px;")
+        self.error.setStyleSheet(
+            f"color: {controller.appearance.palette.error_text}; "
+            f"padding: {controller.appearance.settings.scaled(10)}px;")
         self.error.hide()
         layout.addWidget(self.error)
         layout.addWidget(self.view, 1)
@@ -74,6 +76,7 @@ class OverlayWindow(GraphWindow):
     def receive_appearance(self):
         super().receive_appearance()
         colors = self.controller.appearance.palette
+        padding = self.controller.appearance.settings.scaled(10)
         if self.background_opacity < 1:
             # Paint the translucent color exactly once, beneath all child widgets.
             self.setStyleSheet("#niridashboard-overlay-window, #niridashboard-overlay-root { background: transparent; border: 0px; }")
@@ -85,7 +88,9 @@ class OverlayWindow(GraphWindow):
                 palette.setColor(palette.ColorRole.Window, Qt.GlobalColor.transparent)
                 palette.setColor(palette.ColorRole.Base, Qt.GlobalColor.transparent)
                 widget.setPalette(palette)
-            self.error.setStyleSheet(f"color: {colors.error_text}; background: transparent; padding: 10px;")
+            self.error.setStyleSheet(
+                f"color: {colors.error_text}; background: transparent; "
+                f"padding: {padding}px;")
             self.update()
             return
         self.setStyleSheet(
@@ -97,7 +102,8 @@ class OverlayWindow(GraphWindow):
             palette.setColor(palette.ColorRole.Base, QColor(colors.dashboard_background))
             widget.setPalette(palette)
             widget.setAutoFillBackground(True)
-        self.error.setStyleSheet(f"color: {colors.error_text}; padding: 10px;")
+        self.error.setStyleSheet(
+            f"color: {colors.error_text}; padding: {padding}px;")
 
     def paintEvent(self, event):
         super().paintEvent(event)

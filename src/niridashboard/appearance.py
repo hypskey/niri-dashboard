@@ -1,5 +1,6 @@
 """Noctalia color provider and centralized non-color dashboard settings."""
 from dataclasses import dataclass
+import math
 import os
 from pathlib import Path
 import re
@@ -64,6 +65,8 @@ class DashboardSettings:
     workspace_row: int = 144
     branch_gap: int = 60
     graph_padding: int = 32
+    # Uniform UI-density multiplier for fonts, icons, cards, HUDs and spacing.
+    global_scale: float = 1.0
     overlay_max_width_percent: int = 86
     overlay_max_height_percent: int = 86
     overlay_min_width: int = 360
@@ -71,8 +74,8 @@ class DashboardSettings:
     overlay_opacity: float = 1.0
     background_opacity: float = 1.0
     focus_path_glow: bool = True
-    focus_path_flow: bool = True
-    focus_path_flow_speed: float = 1.0
+    show_hud: bool = True
+    show_pet: bool = True
 
     @classmethod
     def load(cls, path=None):
@@ -111,10 +114,11 @@ class DashboardSettings:
         if not isinstance(focus_path, dict):
             focus_path = {}
         glow = focus_path.get("glow", defaults.focus_path_glow)
-        flow = focus_path.get("flow", defaults.focus_path_flow)
-        flow_speed = focus_path.get("flow_speed", defaults.focus_path_flow_speed)
-        if isinstance(flow_speed, bool) or not isinstance(flow_speed, (int, float)) or not .1 <= flow_speed <= 5:
-            flow_speed = defaults.focus_path_flow_speed
+        ui = parsed.get("ui", {})
+        if not isinstance(ui, dict):
+            ui = {}
+        show_hud = ui.get("show_hud", defaults.show_hud)
+        show_pet = ui.get("show_pet", defaults.show_pet)
 
         opacity = overlay.get("opacity", defaults.overlay_opacity)
         if isinstance(opacity, bool) or not isinstance(opacity, (int, float)) or not 0 <= opacity <= 1:
@@ -123,6 +127,15 @@ class DashboardSettings:
         if isinstance(background_opacity, bool) or not isinstance(background_opacity, (int, float)):
             background_opacity = defaults.background_opacity
         background_opacity = max(0.0, min(1.0, float(background_opacity)))
+        # The appearance-level key is authoritative. Keep accepting the brief
+        # graph-level spelling so existing user files migrate without breaking.
+        global_scale = appearance.get(
+            "global_scale", graph.get("global_scale", defaults.global_scale))
+        if (isinstance(global_scale, bool) or
+                not isinstance(global_scale, (int, float)) or
+                not math.isfinite(global_scale)):
+            global_scale = defaults.global_scale
+        global_scale = max(0.6, min(2.0, float(global_scale)))
 
         icon_size = integer(graph, "icon_size", defaults.icon_size, 16, 64)
         node_width = max(icon_size + 24, integer(graph, "node_width", defaults.node_width, 80, 240))
@@ -145,6 +158,7 @@ class DashboardSettings:
             workspace_row=workspace_row,
             branch_gap=integer(graph, "branch_gap", defaults.branch_gap, 24, 200),
             graph_padding=integer(graph, "graph_padding", defaults.graph_padding, 0, 160),
+            global_scale=global_scale,
             overlay_max_width_percent=integer(overlay, "max_width_percent", defaults.overlay_max_width_percent, 10, 100),
             overlay_max_height_percent=integer(overlay, "max_height_percent", defaults.overlay_max_height_percent, 10, 100),
             overlay_min_width=integer(overlay, "min_width", defaults.overlay_min_width, 200, 7680),
@@ -152,9 +166,22 @@ class DashboardSettings:
             overlay_opacity=float(opacity),
             background_opacity=background_opacity,
             focus_path_glow=glow if isinstance(glow, bool) else defaults.focus_path_glow,
-            focus_path_flow=flow if isinstance(flow, bool) else defaults.focus_path_flow,
-            focus_path_flow_speed=float(flow_speed),
+            show_hud=show_hud if isinstance(show_hud, bool) else defaults.show_hud,
+            show_pet=show_pet if isinstance(show_pet, bool) else defaults.show_pet,
         )
+
+    def scaled(self, value, minimum=1):
+        """Scale an integer UI metric through the single density setting."""
+        return max(minimum, round(value * self.global_scale))
+
+    def scaled_f(self, value):
+        """Scale a floating-point scene/UI metric without premature rounding."""
+        return float(value) * self.global_scale
+
+    def layout_scaled(self, value, minimum=1):
+        """Scale graph topology gently so fitted component sizes still change."""
+        factor = 1.0 + (self.global_scale - 1.0) * 0.35
+        return max(minimum, round(value * factor))
 
 
 def default_theme_path():

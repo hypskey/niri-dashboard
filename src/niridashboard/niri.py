@@ -1,6 +1,8 @@
 """Bounded, synchronous Niri IPC. Called exclusively by the background worker."""
 import json
 import os
+from pathlib import Path
+import signal
 import socket
 import time
 
@@ -57,6 +59,52 @@ def focus_window(window_id):
 
 def close_window(window_id):
     return action("CloseWindow", id=window_id)
+
+
+def force_close_window(window_id):
+    """Kill the sole client process behind a Niri window, if safely identifiable.
+
+    Niri has no per-window force-close action. A shared client PID (notably a
+    multi-window browser or Xwayland satellite) cannot be killed as one window.
+    """
+    windows = get_windows()
+    target = next((window for window in windows if window["id"] == window_id), None)
+    if target is None:
+        return  # It closed after the first, graceful Ctrl+tap.
+    pid = target.get("pid")
+    if (not isinstance(pid, int) or isinstance(pid, bool) or pid <= 1 or
+            pid == os.getpid() or target.get("app_id") == APP_ID):
+        raise RuntimeError("This window has no safe client process to kill.")
+    if any(window["id"] != window_id and window.get("pid") == pid
+           for window in windows):
+        raise RuntimeError("This app shares a process with other windows; refusing to close them all.")
+    try:
+        if os.stat(f"/proc/{pid}").st_uid != os.getuid():
+            raise RuntimeError("The window's process belongs to another user.")
+        name = Path(f"/proc/{pid}/comm").read_text().strip().lower()
+    except OSError as error:
+        raise RuntimeError("The window's process is no longer available.") from error
+    # Linux comm is truncated to 15 bytes, so xwayland-satellite can appear
+    # as xwayland-satel.
+    if name in {"niri", "niridashboard"} or name.startswith("xwayland"):
+        raise RuntimeError("This is a shared or protected system process.")
+    if not hasattr(os, "pidfd_open") or not hasattr(signal, "pidfd_send_signal"):
+        raise RuntimeError("This Linux system cannot safely signal a window process.")
+    try:
+        pidfd = os.pidfd_open(pid)
+    except OSError as error:
+        raise RuntimeError("The window's process is no longer available.") from error
+    try:
+        current = get_windows()
+        if not any(window["id"] == window_id and window.get("pid") == pid
+                   for window in current):
+            return  # The window closed or changed while opening its pidfd.
+        if any(window["id"] != window_id and window.get("pid") == pid
+               for window in current):
+            raise RuntimeError("This app now shares a process with other windows; refusing to close them all.")
+        signal.pidfd_send_signal(pidfd, signal.SIGKILL)
+    finally:
+        os.close(pidfd)
 
 
 def move_window_to_workspace(window_id, workspace_id):

@@ -1,11 +1,13 @@
 import copy
 import os
 import unittest
+from dataclasses import replace
 from unittest.mock import patch
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from PySide6.QtCore import QPoint, QPointF, QRectF, Qt
+from PySide6.QtGui import QTransform
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication, QGraphicsLineItem
+from PySide6.QtWidgets import QApplication, QGraphicsEllipseItem, QGraphicsLineItem
 from niridashboard import niri
 from niridashboard.backend import Backend, demo_state
 from niridashboard.main import Dashboard
@@ -145,6 +147,8 @@ class GraphTests(unittest.TestCase):
         self.dashboard.show()
         self.app.processEvents()
         self.view = self.dashboard.view
+        self.hints = []
+        self.view.hint.connect(self.hints.append)
         self.moves = []
         self.focuses = []
         # Record gestures without submitting work to an unstarted worker.
@@ -176,6 +180,37 @@ class GraphTests(unittest.TestCase):
         self.assertEqual(self.focuses, [1])
         self.assertEqual(self.moves, [])
 
+    def test_touch_jitter_below_larger_threshold_remains_a_click(self):
+        start = self.center(1)
+        node = self.view.nodes[1]
+        QTest.mousePress(self.view.viewport(), Qt.MouseButton.LeftButton,
+                         pos=start)
+        # QTest produces a mouse event, so mark this gesture as the touch path
+        # after press to exercise its deliberately larger threshold.
+        self.view.press_is_touch = True
+        QTest.mouseMove(self.view.viewport(), start + QPoint(10, 8))
+        self.assertFalse(self.view.dragging)
+        QTest.mouseRelease(self.view.viewport(), Qt.MouseButton.LeftButton,
+                           pos=start + QPoint(10, 8))
+        self.assertEqual(self.focuses, [1])
+        self.assertEqual(self.moves, [])
+        self.assertIsNotNone(node.feedback_animation)
+
+    def test_click_has_press_and_release_feedback_without_layout_change(self):
+        start = self.center(1)
+        node = self.view.nodes[1]
+        original_position = QPointF(node.pos())
+        QTest.mousePress(self.view.viewport(), Qt.MouseButton.LeftButton,
+                         pos=start)
+        self.assertTrue(node.pressed_feedback)
+        self.assertGreater(node.scale(), 1.0)
+        QTest.mouseRelease(self.view.viewport(), Qt.MouseButton.LeftButton,
+                           pos=start)
+        QTest.qWait(220)
+        self.assertFalse(node.pressed_feedback)
+        self.assertAlmostEqual(node.scale(), 1.0)
+        self.assertEqual(node.pos(), original_position)
+
     def test_focused_window_draws_one_accent_route_over_neutral_pipes(self):
         state = demo_state()
         target = next(window for window in state["windows"] if window["workspace_id"] == 4 and window["layout"]["pos_in_scrolling_layout"][0] == 2)
@@ -188,7 +223,11 @@ class GraphTests(unittest.TestCase):
         normal_lines = [item for item in lines if item.pen().widthF() in (2, 3)]
         route = self.view.focus_path
         self.assertEqual(route.accent.name(), self.view.colors.focused_route.lower())
-        self.assertEqual(route.endpoint, self.view.nodes[target['id']].pos() + QPointF(27, 27))
+        circle = self.view.nodes[target['id']].icon_circle_rect(self.view.settings)
+        offset = QPointF(circle.left(), circle.center().y())
+        self.assertEqual(route.endpoint,
+                         self.view.nodes[target['id']].pos() +
+                         offset)
         self.assertEqual(route.path.elementCount(), 3)
         self.assertEqual(len(route.junctions), 1)
         self.assertTrue(normal_lines)
@@ -197,7 +236,11 @@ class GraphTests(unittest.TestCase):
 
         refreshed = demo_state()
         self.dashboard.receive_state(refreshed)
-        self.assertEqual(self.view.focus_path.endpoint, self.view.nodes[1].pos() + QPointF(27, 27))
+        circle = self.view.nodes[1].icon_circle_rect(self.view.settings)
+        self.assertEqual(
+            self.view.focus_path.endpoint,
+            self.view.nodes[1].pos() +
+            QPointF(circle.left(), circle.center().y()))
 
         second_workspace = demo_state()
         target = next(window for window in second_workspace["windows"] if window["workspace_id"] == 5)
@@ -207,11 +250,107 @@ class GraphTests(unittest.TestCase):
         self.assertEqual(len(self.view.focus_path.junctions), 2)
         self.assertGreater(self.view.focus_path.junctions[-1].y(), 141)
 
+    def test_pipes_meet_app_circle_edges_and_centers_at_every_ui_scale(self):
+        for scale in (0.6, 1.0, 1.5, 2.0):
+            with self.subTest(scale=scale):
+                self.view.settings = replace(self.view.settings,
+                                             global_scale=scale)
+                self.view.render(demo_state())
+                first, second = self.view.nodes[1], self.view.nodes[2]
+                circle = first.icon_circle_rect(self.view.settings)
+                first_left = first.pos().x() + circle.left()
+                first_right = first.pos().x() + circle.right()
+                second_left = second.pos().x() + circle.left()
+                center_y = first.pos().y() + circle.center().y()
+                lines = [item.line() for item in self.view.scene().items()
+                         if isinstance(item, QGraphicsLineItem) and
+                         item.parentItem() is None]
+
+                def connected(x1, x2):
+                    return any(
+                        abs(line.x1() - x1) < .01 and
+                        abs(line.x2() - x2) < .01 and
+                        abs(line.y1() - center_y) < .01 and
+                        abs(line.y2() - center_y) < .01
+                        for line in lines)
+
+                self.assertTrue(connected(first_right, second_left))
+                self.assertTrue(any(
+                    abs(line.x2() - first_left) < .01 and
+                    abs(line.y1() - center_y) < .01 and
+                    abs(line.y2() - center_y) < .01
+                    for line in lines))
+                self.assertEqual(self.view.focus_path.endpoint,
+                                 QPointF(first_left, center_y))
+
     def test_right_click_closes_target_without_focusing(self):
         QTest.mouseClick(self.view.viewport(), Qt.MouseButton.RightButton, pos=self.center(2))
         self.assertEqual(self.dashboard.backend.commands.get_nowait(), ("close", 2))
         self.assertEqual(self.focuses, [])
         self.assertEqual(self.moves, [])
+
+    def test_control_click_closes_target_without_focusing_or_moving(self):
+        QTest.mouseClick(self.view.viewport(), Qt.MouseButton.LeftButton,
+                         Qt.KeyboardModifier.ControlModifier, self.center(2))
+        self.assertEqual(self.dashboard.backend.commands.get_nowait(), ("close", 2))
+        self.assertEqual(self.focuses, [])
+        self.assertEqual(self.moves, [])
+        self.assertFalse(self.view.interacting)
+
+    def test_double_control_click_queues_force_close_for_same_window(self):
+        target = self.center(2)
+        QTest.mouseClick(self.view.viewport(), Qt.MouseButton.LeftButton,
+                         Qt.KeyboardModifier.ControlModifier, target)
+        QTest.mouseClick(self.view.viewport(), Qt.MouseButton.LeftButton,
+                         Qt.KeyboardModifier.ControlModifier, target)
+        self.assertEqual(self.dashboard.backend.commands.get_nowait(), ("close", 2))
+        self.assertEqual(self.dashboard.controller.pending_force_close[1], (2,))
+        self.dashboard.controller.action_finished(True, "Close requested")
+        self.assertEqual(self.dashboard.backend.commands.get_nowait(), ("force_close", 2))
+        self.assertEqual(self.focuses, [])
+        self.assertEqual(self.moves, [])
+
+    def test_qt_double_click_event_also_requests_force_close(self):
+        target = self.center(2)
+        QTest.mouseClick(self.view.viewport(), Qt.MouseButton.LeftButton,
+                         Qt.KeyboardModifier.ControlModifier, target)
+        QTest.mouseDClick(self.view.viewport(), Qt.MouseButton.LeftButton,
+                          Qt.KeyboardModifier.ControlModifier, target)
+        QTest.mouseRelease(self.view.viewport(), Qt.MouseButton.LeftButton,
+                           Qt.KeyboardModifier.ControlModifier, target)
+        self.assertEqual(self.dashboard.backend.commands.get_nowait(), ("close", 2))
+        self.assertEqual(self.dashboard.controller.pending_force_close[1], (2,))
+
+    def test_control_touch_drag_cancels_close_and_small_motion_still_closes(self):
+        start = self.center(2)
+        QTest.mousePress(self.view.viewport(), Qt.MouseButton.LeftButton,
+                         Qt.KeyboardModifier.ControlModifier, start)
+        self.view.close_is_touch = True
+        QTest.mouseMove(self.view.viewport(), start + QPoint(30, 15))
+        QTest.mouseRelease(self.view.viewport(), Qt.MouseButton.LeftButton,
+                           Qt.KeyboardModifier.ControlModifier,
+                           start + QPoint(30, 15))
+        self.assertTrue(self.dashboard.backend.commands.empty())
+        self.assertEqual(self.focuses, [])
+        self.assertEqual(self.moves, [])
+        self.assertFalse(self.view.interacting)
+
+        QTest.mousePress(self.view.viewport(), Qt.MouseButton.LeftButton,
+                         Qt.KeyboardModifier.ControlModifier, start)
+        self.view.close_is_touch = True
+        QTest.mouseMove(self.view.viewport(), start + QPoint(2, 2))
+        QTest.mouseRelease(self.view.viewport(), Qt.MouseButton.LeftButton,
+                           Qt.KeyboardModifier.ControlModifier,
+                           start + QPoint(2, 2))
+        self.assertEqual(self.dashboard.backend.commands.get_nowait(), ("close", 2))
+
+    def test_control_click_ignored_while_disconnected_or_busy(self):
+        for connected, busy in [(False, False), (True, True)]:
+            self.view.connected, self.view.busy = connected, busy
+            QTest.mouseClick(self.view.viewport(), Qt.MouseButton.LeftButton,
+                             Qt.KeyboardModifier.ControlModifier, self.center(2))
+            self.assertTrue(self.dashboard.backend.commands.empty())
+            self.assertEqual(self.focuses, [])
 
     def test_right_click_ignored_while_disconnected_or_busy(self):
         for connected, busy in [(False, False), (True, True)]:
@@ -239,6 +378,14 @@ class GraphTests(unittest.TestCase):
         node = self.view.nodes[2]
         self.drag(3, self.view.mapFromScene(node.pos() + QPointF(5, 50)))
         self.assertEqual(self.moves, [(3, 1, 2)])
+
+    def test_same_workspace_reorder_uses_collapsed_card_positions(self):
+        row = next(r for r in self.view.rows if r["workspace"]["id"] == 1)
+        endpoint = self.view.mapFromScene(QPointF(
+            row["start"] + row["step"] + 5,
+            row["y"] + row["node_height"] / 2))
+        self.drag(1, endpoint)
+        self.assertEqual(self.moves, [(1, 1, 3)])
 
     def test_escape_and_invalid_drop_do_nothing(self):
         self.drag(1, QPoint(10, 10), cancel=True)
@@ -289,6 +436,174 @@ class GraphTests(unittest.TestCase):
         self.dashboard.receive_state(data)
         self.assertEqual(len(self.view.rows), 7)
 
+    def test_dedicated_hdmi_a5_output_is_hidden_but_dp5_remains_visible(self):
+        data = demo_state()
+        data["outputs"]["DP-5"] = {
+            "model": "Normal display",
+            "logical": {"x": 5760, "y": 0, "width": 1920, "height": 1080},
+        }
+        data["outputs"]["HDMI-A-5"] = {
+            "model": "Dedicated dashboard",
+            "logical": {"x": 7680, "y": 0, "width": 1920, "height": 1080},
+        }
+        data["workspaces"].append({
+            "id": 99, "idx": 1, "output": "DP-5",
+            "is_active": True, "is_focused": False,
+        })
+        data["windows"].append(window(99, workspace=99, focused=True))
+        data["workspaces"].append({
+            "id": 100, "idx": 1, "output": "HDMI-A-5",
+            "is_active": True, "is_focused": True,
+        })
+        data["windows"].append(window(100, workspace=100))
+        self.dashboard.receive_state(data)
+        labels = [item.text() for item in self.view.scene().items()
+                  if hasattr(item, "text")]
+        self.assertTrue(any(label.endswith("/  DP-5") for label in labels))
+        self.assertFalse(any(label.endswith("/  HDMI-A-5") for label in labels))
+        self.assertIn(99, self.view.nodes)
+        self.assertNotIn(100, self.view.nodes)
+        workspace_ids = [row["workspace"]["id"] for row in self.view.rows]
+        self.assertIn(99, workspace_ids)
+        self.assertNotIn(100, workspace_ids)
+
+    def test_manual_zoom_limit_does_not_change_default_fit(self):
+        self.view.fit_graph()
+        base_scale = self.view.transform().m11()
+        scene_rect = QRectF(self.view.sceneRect())
+        self.view.fit_graph()
+        self.assertAlmostEqual(self.view.transform().m11(), base_scale)
+        self.assertAlmostEqual(self.view.default_scale, base_scale)
+        for _ in range(10):
+            self.view.zoom(1.15)
+        self.assertAlmostEqual(self.view.transform().m11(), base_scale * 1.5)
+        self.assertEqual(self.view.sceneRect(), scene_rect)
+
+    def test_full_viewport_fit_contains_dense_graph_without_chrome(self):
+        data = demo_state()
+        for wid in range(100, 130):
+            data["windows"].append(window(wid, workspace=1, col=wid))
+        data["workspaces"].extend(
+            {"id": wid, "idx": wid - 90, "output": "DP-1",
+             "is_active": False, "is_focused": False}
+            for wid in range(101, 117))
+        data["windows"].append(window(200, workspace=116, col=1))
+        self.dashboard.receive_state(data)
+        self.app.processEvents()
+        self.assertLess(self.view.transform().m11(), 1.0)
+        bounds = self.view.graph_bounds
+        viewport = self.view.viewport().rect()
+        for corner in (bounds.topLeft(), bounds.topRight(),
+                       bounds.bottomLeft(), bounds.bottomRight()):
+            point = self.view.mapFromScene(corner)
+            self.assertTrue(viewport.adjusted(-1, -1, 1, 1).contains(point))
+        self.assertEqual(self.dashboard.centralWidget().layout().contentsMargins().left(), 0)
+
+    def test_unchanged_geometry_refresh_preserves_manual_zoom_and_pan(self):
+        self.view.zoom(1.15)
+        self.view.horizontalScrollBar().setValue(
+            self.view.horizontalScrollBar().value() + 20)
+        transform = QTransform(self.view.transform())
+        center = self.view.mapToScene(self.view.viewport().rect().center())
+        data = demo_state()
+        data["windows"][0]["title"] = "Different title, same topology"
+        self.dashboard.receive_state(data)
+        self.app.processEvents()
+        self.assertEqual(self.view.transform(), transform)
+        new_center = self.view.mapToScene(self.view.viewport().rect().center())
+        self.assertAlmostEqual(new_center.x(), center.x(), delta=2.0)
+        self.assertAlmostEqual(new_center.y(), center.y(), delta=2.0)
+
+    def test_global_ui_scale_changes_card_icon_and_graph_metrics(self):
+        self.view.settings = replace(self.view.settings, global_scale=1.25)
+        self.view.render(demo_state())
+        self.assertEqual(self.view.nodes[1].width,
+                         round(self.view.settings.node_width * 1.25))
+        self.assertEqual(self.view.settings.scaled(self.view.settings.icon_size),
+                         round(self.view.settings.icon_size * 1.25))
+        expected_step = max(
+            self.view.settings.layout_scaled(self.view.settings.workspace_step),
+            self.view.settings.scaled(self.view.settings.node_width) +
+            self.view.settings.layout_scaled(28))
+        self.assertEqual(self.view.rows[0]["step"], expected_step)
+
+    def test_empty_workspace_plus_is_centered_at_every_ui_scale(self):
+        for scale in (0.6, 1.0, 1.5, 2.0):
+            with self.subTest(scale=scale):
+                self.view.settings = replace(
+                    self.view.settings, global_scale=scale)
+                self.view.render(demo_state())
+                empty_row = next(row for row in self.view.rows
+                                 if not row["windows"])
+                plus = next(
+                    item for item in self.view.scene().items()
+                    if hasattr(item, "text") and item.text() == "+" and
+                    empty_row["rect"].contains(item.sceneBoundingRect().center()))
+                circle = next(
+                    item for item in self.view.scene().items()
+                    if isinstance(item, QGraphicsEllipseItem) and
+                    item.sceneBoundingRect().contains(
+                        plus.sceneBoundingRect().center()))
+                self.assertAlmostEqual(
+                    plus.sceneBoundingRect().center().x(),
+                    circle.sceneBoundingRect().center().x(), delta=0.5)
+                self.assertAlmostEqual(
+                    plus.sceneBoundingRect().center().y(),
+                    circle.sceneBoundingRect().center().y() -
+                    self.view.settings.scaled_f(1.5), delta=0.5)
+
+    def test_workspace_number_clears_junction_at_every_ui_scale(self):
+        for scale in (0.6, 1.0, 1.5, 2.0):
+            with self.subTest(scale=scale):
+                self.view.settings = replace(
+                    self.view.settings, global_scale=scale)
+                self.view.render(demo_state())
+                row = self.view.rows[0]
+                number = min(
+                    (item for item in self.view.scene().items()
+                     if hasattr(item, "text") and item.text() == "01"),
+                    key=lambda item: item.sceneBoundingRect().left())
+                dot = min(
+                    (item for item in self.view.scene().items()
+                     if isinstance(item, QGraphicsEllipseItem) and
+                     abs(item.sceneBoundingRect().center().y() -
+                         row["y"] - self.view.nodes[1].icon_circle_rect(
+                             self.view.settings).center().y()) < 2),
+                    key=lambda item: item.sceneBoundingRect().left())
+                self.assertLess(number.sceneBoundingRect().right(),
+                                dot.sceneBoundingRect().left())
+
+    def test_default_fit_is_idempotent_and_is_the_minimum_zoom(self):
+        self.view.fit_graph()
+        default = self.view.transform().m11()
+        default_transform = QTransform(self.view.transform())
+        self.view.fit_graph()
+        self.assertEqual(self.view.transform(), default_transform)
+
+        self.view.zoom(1 / 1.15)
+        self.assertAlmostEqual(self.view.transform().m11(), default)
+        self.assertTrue(self.view.auto_fit)
+
+        self.view.zoom(1.15)
+        self.assertGreater(self.view.transform().m11(), default)
+        self.assertFalse(self.view.auto_fit)
+        self.view.zoom(1 / 1.15)
+        self.assertEqual(self.view.transform(), default_transform)
+        self.assertTrue(self.view.auto_fit)
+
+    def test_f_and_empty_double_click_restore_default_fit(self):
+        self.view.fit_graph()
+        default_transform = QTransform(self.view.transform())
+
+        self.view.zoom(1.15)
+        QTest.keyClick(self.view, Qt.Key.Key_F)
+        self.assertEqual(self.view.transform(), default_transform)
+
+        self.view.zoom(1.15)
+        empty = self.view.mapFromScene(self.view.sceneRect().bottomRight())
+        QTest.mouseDClick(self.view.viewport(), Qt.MouseButton.LeftButton, pos=empty)
+        self.assertEqual(self.view.transform(), default_transform)
+
     def test_hides_only_trailing_empty_workspaces_and_keeps_one_on_idle_output(self):
         self.assertEqual([row["workspace"]["id"] for row in self.view.rows], [1, 2, 4, 5, 7, 8, 9])
         state = demo_state()
@@ -310,31 +625,70 @@ class GraphTests(unittest.TestCase):
         self.assertIsNone(self.view.drop)
         self.assertIsNone(self.view.marker)
 
+    def test_drop_on_hidden_trailing_workspace_restores_camera_then_moves(self):
+        target = next(target for target in self.view.trailing_targets
+                      if target["workspace"]["id"] == 3)
+        self.view.fit_graph()
+        initial_transform = QTransform(self.view.transform())
+        initial_rect = QRectF(self.view.sceneRect())
+        endpoint = self.view.mapFromScene(target["rect"].center())
+
+        self.drag(1, endpoint)
+
+        self.assertEqual(self.moves, [(1, 3, None)])
+        self.assertEqual(self.view.transform(), initial_transform)
+        self.assertEqual(self.view.sceneRect(), initial_rect)
+        self.assertFalse(self.view.dragging)
+        self.assertIsNone(self.view.marker)
+
     def test_dragging_to_hidden_workspace_target_keeps_view_transform_stable(self):
         target = next(target for target in self.view.trailing_targets if target["workspace"]["id"] == 3)
         self.view.fit_graph()
         initial_scale = self.view.transform().m11()
         initial_rect = QRectF(self.view.sceneRect())
+        initial_center = self.view.mapToScene(self.view.viewport().rect().center())
         self.view.pressed = self.view.nodes[1]
         self.view.origin = QPointF(self.view.pressed.pos())
         self.view.offset = QPointF()
         self.view.dragging = True
         self.view.drag_scene_rect = QRectF(self.view.sceneRect())
-        self.view.drag_transform = self.view.transform()
+        self.view.drag_transform = QTransform(self.view.transform())
+        self.view.drag_center = QPointF(initial_center)
+        self.view.drag_auto_fit = self.view.auto_fit
 
-        self.view.update_drag(self.view.mapFromScene(target["rect"].center()))
+        target_point = self.view.mapFromScene(target["rect"].center())
+        self.view.update_drag(target_point)
+        stable_rect = QRectF(self.view.sceneRect())
+        stable_center = self.view.mapToScene(self.view.viewport().rect().center())
+        for _ in range(20):
+            self.view.update_drag(target_point)
+            self.assertEqual(self.view.sceneRect(), stable_rect)
+            self.assertEqual(self.view.transform().m11(), initial_scale)
+            center = self.view.mapToScene(self.view.viewport().rect().center())
+            self.assertAlmostEqual(center.x(), stable_center.x(), delta=1.0)
+            self.assertAlmostEqual(center.y(), stable_center.y(), delta=1.0)
         self.view.fit_graph()
         self.view.resize(self.view.width() - 17, self.view.height() - 13)
         self.app.processEvents()
 
         self.assertAlmostEqual(self.view.transform().m11(), initial_scale)
         self.assertIsNotNone(self.view.marker)
+        self.assertEqual(
+            self.view.horizontalScrollBarPolicy(),
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.assertEqual(
+            self.view.verticalScrollBarPolicy(),
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.view.cancel_drag()
         self.assertEqual(self.view.sceneRect(), initial_rect)
         self.assertAlmostEqual(self.view.transform().m11(), initial_scale)
+        restored_center = self.view.mapToScene(
+            self.view.viewport().rect().center())
+        self.assertAlmostEqual(restored_center.x(), initial_center.x(), delta=2.0)
+        self.assertAlmostEqual(restored_center.y(), initial_center.y(), delta=2.0)
 
     def help_text(self):
-        return self.dashboard.help.text()
+        return self.hints[-1] if self.hints else ""
 
     def test_workspace_labels_are_numbers_and_output_names_remain_visible(self):
         labels = [item.text() for item in self.view.scene().items()

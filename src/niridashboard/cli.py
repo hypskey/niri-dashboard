@@ -52,11 +52,15 @@ def run_gui(args):
 
     def handle(command, ipc_latency_ms=0):
         if command == "status":
+            cue = controller.attention.current
             return {"pid": __import__("os").getpid(), "connected": controller.connected,
                     "overlay": overlay.phase, "overlay_window_id": overlay.window_id,
                     "output": (overlay.context or {}).get("output"), "last_open_ms": overlay.last_open_ms,
                     "timings_ms": dict(overlay.timings_ms),
-                    "error": overlay.failure, "polling_workers": int(controller.backend.isRunning())}
+                    "error": overlay.failure, "polling_workers": int(controller.backend.isRunning()),
+                    "attention": ({"window_id": cue.window_id, "label": cue.label,
+                                   "number": cue.number} if cue else None),
+                    "last_attention_event": controller.attention.last_event}
         if command == "quit":
             QTimer.singleShot(0, shutdown)
             return "Stopping NiriDashboard"
