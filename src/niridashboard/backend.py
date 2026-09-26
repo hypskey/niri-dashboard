@@ -3,6 +3,7 @@ import copy
 import queue
 from PySide6.QtCore import QThread, Signal
 from . import niri
+from .dashboard_nodes import dashboard_nodes
 
 
 class Backend(QThread):
@@ -92,6 +93,31 @@ class Backend(QThread):
         wid, workspace, anchor = args
         window = next(w for w in self.data["windows"] if w["id"] == wid)
         old = window["workspace_id"]
+        source_node = next(node for node in dashboard_nodes(
+            w for w in self.data["windows"] if w["workspace_id"] == old)
+            if node.contains(wid))
+        if source_node.is_stack:
+            member_ids = {member["id"] for member in source_node.members}
+            if anchor in member_ids:
+                return
+            destination = list(dashboard_nodes(
+                w for w in self.data["windows"]
+                if w["workspace_id"] == workspace and w["id"] not in member_ids))
+            index = next((i for i, node in enumerate(destination)
+                          if node.contains(anchor)), len(destination))
+            destination.insert(index, source_node)
+            groups = [(workspace, destination)]
+            if old != workspace:
+                groups.append((old, dashboard_nodes(
+                    w for w in self.data["windows"]
+                    if w["workspace_id"] == old and w["id"] not in member_ids)))
+            for workspace_id, nodes in groups:
+                for column, node in enumerate(nodes, 1):
+                    for row, member in enumerate(node.members, 1):
+                        member["workspace_id"] = workspace_id
+                        member["is_floating"] = False
+                        member["layout"] = {"pos_in_scrolling_layout": [column, row]}
+            return
         peers = niri.ordered([w for w in self.data["windows"] if w["workspace_id"] == workspace and w["id"] != wid])
         index = next((i for i, w in enumerate(peers) if w["id"] == anchor), len(peers))
         peers.insert(index, window)

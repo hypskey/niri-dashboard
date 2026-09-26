@@ -4,6 +4,7 @@ from .backend import Backend
 from .icons import Icons
 from .icon_overrides import IconOverrides
 from .icon_usage import IconUsage
+from .dashboard_nodes import dashboard_nodes
 from .browser_tabs import BrowserTabs
 from .attention import AttentionManager
 from .appearance import AppearanceProvider
@@ -107,8 +108,10 @@ class DashboardController(QObject):
             workspaces = sorted((workspace for workspace in data["workspaces"]
                                  if workspace.get("output") == name), key=lambda workspace: workspace["idx"])
             for workspace in workspaces:
-                result.extend(window["id"] for window in niri.ordered(
-                    window for window in data["windows"] if window.get("workspace_id") == workspace["id"]))
+                result.extend(member["id"] for node in dashboard_nodes(
+                    window for window in data["windows"]
+                    if window.get("workspace_id") == workspace["id"])
+                    for member in node.members)
         return result
 
     def receive_health(self, connected, message):

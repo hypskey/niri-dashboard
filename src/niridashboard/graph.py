@@ -7,6 +7,7 @@ from PySide6.QtGui import (QColor, QFont, QInputDevice,
                            QTransform)
 from PySide6.QtWidgets import QApplication, QGraphicsItem, QGraphicsLineItem, QGraphicsObject, QGraphicsRectItem, QGraphicsScene, QGraphicsView
 from .appearance import DEFAULT_PALETTE, DashboardSettings
+from .dashboard_nodes import dashboard_nodes
 from .hints import HintAssignments
 from .focus_path import FocusPath
 from .niri import ordered, position
@@ -41,15 +42,19 @@ class AppNode(QGraphicsObject):
         return QRectF(left, 0, icon_size + padding * 2,
                       icon_size + padding * 2)
 
-    def __init__(self, window, icons, color, hint=None, palette=None, settings=None):
+    def __init__(self, dashboard_node, icons, color, hints=None, palette=None, settings=None):
         super().__init__()
-        self.window = window
+        self.dashboard_node = dashboard_node
+        self.window = dashboard_node.window
         self.icons = icons
         self.label, self.icon = icons.resolve_for_window(
-            window.get("app_id"), window.get("title"), window.get("browser_hostname"),
-            window.get("icon_override"))
+            self.window.get("app_id"), self.window.get("title"),
+            self.window.get("browser_hostname"), self.window.get("icon_override"))
         self.color = color
-        self.hint = str(hint) if hint is not None else ""
+        self.hints = {member["id"]: str(hints[member["id"]])
+                      for member in dashboard_node.members
+                      if hints and member["id"] in hints}
+        self.hint = self.hints.get(self.window["id"], "")
         self.palette = palette or DEFAULT_PALETTE
         self.settings = settings or DashboardSettings()
         self.width = self.settings.scaled(self.settings.node_width)
@@ -62,9 +67,27 @@ class AppNode(QGraphicsObject):
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setZValue(5)
         self.setTransformOriginPoint(self.width / 2, self.height / 2)
-        pos = position(window)
-        detail = "Floating · dropping inserts into tiling" if window.get("is_floating") else f"Column {pos[0]}, row {pos[1]}" if pos else "Position unavailable"
-        self.setToolTip(f"{self.label}\n{window.get('title') or 'Untitled window'}\n{detail}\nDrag to a workspace or between apps")
+        pos = position(self.window)
+        detail = "Floating · dropping inserts into tiling" if self.window.get("is_floating") else f"Column {pos[0]}, row {pos[1]}" if pos else "Position unavailable"
+        if dashboard_node.is_stack:
+            names = [icons.resolve_for_window(member.get("app_id"), member.get("title"),
+                     member.get("browser_hostname"), member.get("icon_override"))[0]
+                     for member in dashboard_node.members]
+            self.setToolTip(f"Stack: {names[0]} / {names[1]}\n{detail}\nDrag the whole stack")
+        else:
+            self.setToolTip(f"{self.label}\n{self.window.get('title') or 'Untitled window'}\n{detail}\nDrag to a workspace or between apps")
+
+    def member_at(self, scene_point):
+        """Choose a stack member by icon half; the label area uses the active one."""
+        if not self.dashboard_node.is_stack:
+            return self.window
+        circle = self.icon_circle_rect(self.settings)
+        point = self.mapFromScene(scene_point)
+        if circle.top() <= point.y() <= circle.bottom():
+            # The two icon halves remain targetable across the full width of
+            # the icon band, including the transparent corners of the circle.
+            return self.dashboard_node.members[0 if point.y() < circle.center().y() else 1]
+        return self.dashboard_node.focused_member
 
     def boundingRect(self):
         edge = self.settings.scaled_f(3)
@@ -73,7 +96,7 @@ class AppNode(QGraphicsObject):
 
     def paint(self, p, option, widget=None):
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        focused = self.window.get("is_focused")
+        focused = self.dashboard_node.focused
         s = self.settings.scaled
         sf = self.settings.scaled_f
         icon_size = s(self.settings.icon_size)
@@ -95,6 +118,43 @@ class AppNode(QGraphicsObject):
                       sf(2 if focused or self.pressed_feedback else 1)))
         p.drawEllipse(circle)
         p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+        if self.dashboard_node.is_stack:
+            self._paint_stack_icons(p, circle)
+            for index, member in enumerate(self.dashboard_node.members):
+                member_focused = member is self.dashboard_node.focused_member and focused
+                label_font = font(self.settings.application_title_size, True, self.settings)
+                if member_focused:
+                    label_font.setWeight(QFont.Weight.Bold)
+                p.setFont(label_font)
+                p.setPen(QColor(self.palette.primary_text if member_focused
+                                else self.palette.application_title))
+                name = self.icons.resolve_for_window(
+                    member.get("app_id"), member.get("title"),
+                    member.get("browser_hostname"), member.get("icon_override"))[0]
+                name = p.fontMetrics().elidedText(
+                    name, Qt.TextElideMode.ElideRight, self.width - s(24))
+                label_rect = QRectF(s(6), circle.bottom() + s(4 + 18 * index),
+                                    self.width - s(12), s(18))
+                p.drawText(label_rect, Qt.AlignmentFlag.AlignCenter, name)
+                if member_focused:
+                    dot_x = max(sf(7), (self.width - p.fontMetrics().horizontalAdvance(name)) / 2 - sf(7))
+                    p.setPen(Qt.PenStyle.NoPen)
+                    p.setBrush(QColor(self.palette.focused_route))
+                    p.drawEllipse(QPointF(dot_x, label_rect.center().y()), sf(2.5), sf(2.5))
+            badge_font = font(self.settings.hint_badge_font_size, True, self.settings)
+            p.setFont(badge_font)
+            badge_height = s(20)
+            for index, member in enumerate(self.dashboard_node.members):
+                hint = self.hints.get(member["id"])
+                if hint:
+                    width = max(s(20), p.fontMetrics().horizontalAdvance(hint) + s(10))
+                    gap = sf(4)
+                    x = (circle.left() - gap - width if index == 0
+                         else circle.right() + gap)
+                    y = circle.top() if index == 0 else circle.bottom() - badge_height
+                    badge = QRectF(x, y, width, badge_height)
+                    self._paint_hint_badge(p, badge, hint, badge_font)
+            return
         pixmap = self.icons.rendered(
             self.window.get("app_id"), icon_size, self.window.get("title"),
             self.window.get("browser_hostname"), self.window.get("icon_override"))
@@ -103,14 +163,30 @@ class AppNode(QGraphicsObject):
             px = icon_x + (icon_size - pixmap_size.width()) / 2
             py = sf(8) + (icon_size - pixmap_size.height()) / 2
             p.drawPixmap(QPointF(px, py), pixmap)
-        p.setFont(font(self.settings.application_title_size, True, self.settings))
-        p.setPen(QColor(self.palette.focused_text if focused else self.palette.application_title))
+        label_font = font(self.settings.application_title_size, True, self.settings)
+        if focused:
+            label_font.setWeight(QFont.Weight.Bold)
+        p.setFont(label_font)
+        p.setPen(QColor(self.palette.primary_text if focused else self.palette.application_title))
+        label_width = self.width - s(20 if focused else 12)
         label = p.fontMetrics().elidedText(
-            self.label, Qt.TextElideMode.ElideRight, self.width - s(12))
-        p.drawText(QRectF(s(6), icon_size + s(18), self.width - s(12), s(18)),
-                   Qt.AlignmentFlag.AlignCenter, label)
-        p.setFont(font(self.settings.window_title_size, settings=self.settings))
-        p.setPen(QColor(self.palette.window_title))
+            self.label, Qt.TextElideMode.ElideRight, label_width)
+        label_rect = QRectF(s(6), icon_size + s(18), self.width - s(12), s(18))
+        p.drawText(label_rect, Qt.AlignmentFlag.AlignCenter, label)
+        if focused:
+            # The Noctalia accent foreground is designed for an accent fill and
+            # can be almost invisible on this dark card. Keep the words legible;
+            # let a small accent marker carry the focus color instead.
+            text_width = p.fontMetrics().horizontalAdvance(label)
+            dot_x = max(sf(7), (self.width - text_width) / 2 - sf(7))
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QColor(self.palette.focused_route))
+            p.drawEllipse(QPointF(dot_x, label_rect.center().y()), sf(2.5), sf(2.5))
+        title_font = font(self.settings.window_title_size, settings=self.settings)
+        if focused:
+            title_font.setWeight(QFont.Weight.Medium)
+        p.setFont(title_font)
+        p.setPen(QColor(self.palette.primary_text if focused else self.palette.window_title))
         title = p.fontMetrics().elidedText(
             self.window.get("title") or "Untitled", Qt.TextElideMode.ElideRight,
             self.width - s(12))
@@ -126,11 +202,45 @@ class AppNode(QGraphicsObject):
             p.drawEllipse(QPointF(self.width - sf(5), self.height - sf(5)),
                           sf(4), sf(4))
         if self.hint:
-            p.setPen(QPen(QColor(self.palette.hint_border), sf(1)))
-            p.setBrush(QColor(self.palette.hint_background))
-            p.drawRoundedRect(badge_rect, sf(5), sf(5))
-            p.setPen(QColor(self.palette.hint_text))
-            p.drawText(badge_rect, Qt.AlignmentFlag.AlignCenter, self.hint)
+            self._paint_hint_badge(p, badge_rect, self.hint)
+
+    def _paint_hint_badge(self, painter, rect, hint, badge_font=None):
+        painter.setFont(badge_font or font(self.settings.hint_badge_font_size, True, self.settings))
+        painter.setPen(QPen(QColor(self.palette.hint_border), self.settings.scaled_f(1)))
+        painter.setBrush(QColor(self.palette.hint_background))
+        radius = self.settings.scaled_f(5)
+        painter.drawRoundedRect(rect, radius, radius)
+        painter.setPen(QColor(self.palette.hint_text))
+        painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, hint)
+
+    def _paint_stack_icons(self, painter, circle):
+        ellipse = QPainterPath()
+        ellipse.addEllipse(circle)
+        icon_size = self.settings.scaled(self.settings.icon_size)
+        for index, member in enumerate(self.dashboard_node.members):
+            half = QPainterPath()
+            half.addRect(QRectF(circle.left(), circle.top() + index * circle.height() / 2,
+                                circle.width(), circle.height() / 2))
+            painter.save()
+            painter.setClipPath(ellipse.intersected(half))
+            pixmap = self.icons.rendered(
+                member.get("app_id"), icon_size, member.get("title"),
+                member.get("browser_hostname"), member.get("icon_override"))
+            if not pixmap.isNull():
+                center = circle.center()
+                size = pixmap.deviceIndependentSize()
+                painter.drawPixmap(QPointF(center.x() - size.width() / 2,
+                                           center.y() - size.height() / 2), pixmap)
+            painter.restore()
+        separator = QColor(self.palette.focused_border if self.dashboard_node.focused
+                           else self.palette.node_border)
+        separator.setAlpha(190)
+        painter.save()
+        painter.setClipPath(ellipse)
+        painter.setPen(QPen(separator, self.settings.scaled_f(1)))
+        painter.drawLine(QPointF(circle.left(), circle.center().y()),
+                         QPointF(circle.right(), circle.center().y()))
+        painter.restore()
 
     def hoverEnterEvent(self, event):
         self.hovered = True
@@ -208,6 +318,7 @@ class GraphView(QGraphicsView):
         self.data = None
         self.pressed = None
         self.close_candidate = None
+        self.close_target_id = None
         self.close_press_point = None
         self.close_is_touch = False
         self.close_cancelled = False
@@ -357,7 +468,9 @@ class GraphView(QGraphicsView):
         ordered_window_ids = []
         for name in names:
             all_workspaces = sorted([w for w in data["workspaces"] if w.get("output") == name], key=lambda w: w["idx"])
-            all_groups = [ordered([w for w in data["windows"] if w.get("workspace_id") == ws["id"]]) for ws in all_workspaces]
+            all_groups = [dashboard_nodes(w for w in data["windows"]
+                                          if w.get("workspace_id") == ws["id"])
+                          for ws in all_workspaces]
             last_occupied = max((index for index, windows in enumerate(all_groups) if windows), default=None)
             trailing_workspace = None
             if last_occupied is None:
@@ -366,7 +479,8 @@ class GraphView(QGraphicsView):
                 workspaces, groups = all_workspaces[:last_occupied + 1], all_groups[:last_occupied + 1]
                 if last_occupied + 1 < len(all_workspaces):
                     trailing_workspace = all_workspaces[last_occupied + 1]
-            ordered_window_ids.extend(window["id"] for group in groups for window in group)
+            ordered_window_ids.extend(member["id"] for group in groups
+                                      for node in group for member in node.members)
             branches.append((name, workspaces, groups, trailing_workspace))
         hint_by_id = (dict(self.hint_assignments.by_window) if self.shared_hint_assignments
                       else self.hint_assignments.update(ordered_window_ids))
@@ -401,7 +515,7 @@ class GraphView(QGraphicsView):
             model = outputs.get(name, {}).get("model") or "Workspace branch"
             self.text(f"{model}  ·  {len(workspaces)} workspaces", x, ls(38),
                       self.settings.normal_text_size, self.colors.secondary_text)
-            for row, (ws, windows) in enumerate(zip(workspaces, groups)):
+            for row, (ws, nodes) in enumerate(zip(workspaces, groups)):
                 y = ls(114) + row * row_height
                 branch_y = y + circle_y
                 start = x + ls(110)
@@ -424,11 +538,11 @@ class GraphView(QGraphicsView):
                 self.rows.append({"workspace": ws, "rect": rect,
                                   "hit_rect": rect.adjusted(
                                       0, -s(8), 0, s(8)),
-                                  "start": start, "y": y, "windows": windows,
+                                  "start": start, "y": y, "windows": nodes,
                                   "color": color, "step": step,
                                   "node_width": node_width,
                                   "node_height": node_height})
-                if not windows:
+                if not nodes:
                     placeholder_size = min(s(54), s(self.settings.icon_size) + s(16))
                     placeholder_rect = QRectF(
                         start + circle.left(), branch_y - placeholder_size / 2,
@@ -443,17 +557,21 @@ class GraphView(QGraphicsView):
                         placeholder_rect.center().x() - plus_bounds.width() / 2,
                         placeholder_rect.center().y() - plus_bounds.height() / 2 -
                         sf(1.5))
-                for index, window in enumerate(windows):
+                for index, dashboard_node in enumerate(nodes):
                     nx = start + index * step
                     if index:
                         self.line(nx - step + circle.right(), branch_y,
                                   nx + circle.left(), branch_y, color)
-                    node = AppNode(window, self.icons, color, hint_by_id.get(window["id"]), self.colors, self.settings)
+                    node = AppNode(dashboard_node, self.icons, color,
+                                   hint_by_id, self.colors, self.settings)
                     node.setPos(nx, y)
                     self.scene().addItem(node)
-                    self.nodes[window["id"]] = node
-                    pos = position(window)
-                    if pos and sum(bool(position(w)) and position(w)[0] == pos[0] for w in windows) > 1:
+                    for member in dashboard_node.members:
+                        self.nodes[member["id"]] = node
+                    pos = position(dashboard_node.window)
+                    if (pos and sum(bool(position(other.window)) and
+                                    position(other.window)[0] == pos[0]
+                                    for other in nodes) > 2):
                         self.text(f"STACK {pos[0]} · {pos[1]}", nx + ls(15),
                                   y + node_height + ls(4),
                                   max(6, self.settings.normal_text_size - 2),
@@ -461,9 +579,9 @@ class GraphView(QGraphicsView):
             focus_row = next((index for index, ws in enumerate(workspaces)
                               if ws["id"] == focused_workspace_id), None)
             if focus_row is not None:
-                focus_windows = groups[focus_row]
-                focus_index = next((index for index, window in enumerate(focus_windows)
-                                    if window["id"] == focused_window["id"]), None)
+                focus_nodes = groups[focus_row]
+                focus_index = next((index for index, node in enumerate(focus_nodes)
+                                    if node.contains(focused_window["id"])), None)
                 if focus_index is not None:
                     accent = self.colors.focused_route
                     focus_y = ls(114) + focus_row * row_height + circle_y
@@ -653,6 +771,9 @@ class GraphView(QGraphicsView):
     def node_at(self, pos):
         return next((item for item in self.items(pos) if isinstance(item, AppNode)), None)
 
+    def member_id_at(self, node, point):
+        return node.member_at(self.mapToScene(point))["id"]
+
     @staticmethod
     def _is_touch_event(event):
         device = event.pointingDevice()
@@ -669,13 +790,15 @@ class GraphView(QGraphicsView):
         if event.button() == Qt.MouseButton.RightButton:
             node = self.node_at(event.position().toPoint())
             if node and self.connected and not self.busy and not self.interacting:
-                self.close_requested.emit(node.window["id"])
+                self.close_requested.emit(self.member_id_at(node, event.position().toPoint()))
             event.accept()
             return
         if event.button() == Qt.MouseButton.MiddleButton:
             node = self.node_at(event.position().toPoint())
             if node and not self.interacting:
-                self.icon_picker_requested.emit(node.window["id"], self.viewport().mapToGlobal(event.position().toPoint()))
+                self.icon_picker_requested.emit(
+                    self.member_id_at(node, event.position().toPoint()),
+                    self.viewport().mapToGlobal(event.position().toPoint()))
                 event.accept()
                 return
             self.panning = True
@@ -689,7 +812,7 @@ class GraphView(QGraphicsView):
             node = self.node_at(event.position().toPoint())
             if node and not self.interacting:
                 self.icon_picker_requested.emit(
-                    node.window["id"],
+                    self.member_id_at(node, event.position().toPoint()),
                     self.viewport().mapToGlobal(event.position().toPoint()))
                 event.accept()
                 return
@@ -718,11 +841,13 @@ class GraphView(QGraphicsView):
                 Qt.KeyboardModifier.ControlModifier):
             node = self.node_at(event.position().toPoint())
             if node and not self.interacting:
-                repeated = (self.close_sequence_window_id == node.window["id"] and
+                target_id = self.member_id_at(node, event.position().toPoint())
+                repeated = (self.close_sequence_window_id == target_id and
                             self.close_sequence_timer.isValid() and
                             self.close_sequence_timer.elapsed() <= FORCE_CLOSE_DOUBLE_TAP_MS)
                 if self.connected and (not self.busy or repeated):
                     self.close_candidate = node
+                    self.close_target_id = target_id
                     self.close_press_point = event.position().toPoint()
                     self.close_is_touch = self._is_touch_event(event)
                     self.close_cancelled = False
@@ -806,31 +931,34 @@ class GraphView(QGraphicsView):
             # Re-index the remaining cards after removing the dragged one.  Using
             # their old positions leaves a phantom gap on same-row reorders.
             candidates = list(enumerate(
-                w for w in row["windows"]
-                if w["id"] != self.pressed.window["id"]))
-            before = next(((i, w) for i, w in candidates
+                node for node in row["windows"]
+                if not node.contains(self.pressed.window["id"])))
+            before = next(((i, node) for i, node in candidates
                            if scene_pos.x() < row["start"] + i * row["step"] +
                            row["node_width"] / 2), None)
-            if before and position(before[1]):
+            if before and position(before[1].window):
                 # A tiled insertion is between columns, never inside an existing stack.
-                column = position(before[1])[0]
-                before = next((pair for pair in candidates if position(pair[1]) and position(pair[1])[0] == column), before)
+                column = position(before[1].window)[0]
+                before = next((pair for pair in candidates if position(pair[1].window)
+                               and position(pair[1].window)[0] == column), before)
             elif before:
                 # Floating windows have no column position; insert at the tiled end.
                 before = None
-            anchor = before[1]["id"] if before else None
+            anchor = before[1].window["id"] if before else None
             self.drop = row["workspace"]["id"], anchor
             mx = (row["start"] +
                   (before[0] * row["step"] if before
                    else len(candidates) * row["step"]) -
                   self.settings.scaled(14))
+            circle = AppNode.icon_circle_rect(self.settings)
+            marker_radius = self.settings.scaled_f(2)
             self.marker = self.line(
-                mx, row["y"] - self.settings.scaled(5), mx,
-                row["y"] + row["node_height"] + self.settings.scaled(5),
+                mx, row["y"] + circle.top() + marker_radius, mx,
+                row["y"] + circle.bottom() - marker_radius,
                 row["color"], 4)
             self.marker.setZValue(40)
             destination = f"{row['workspace']['idx']:02d}"
-            where = f"before {self.icons.resolve(before[1].get('app_id'))[0]}" if before else "at the end"
+            where = f"before {self.icons.resolve(before[1].window.get('app_id'))[0]}" if before else "at the end"
             self.hint.emit(f"Move to {row['workspace'].get('output') or 'unassigned'} / {destination} · {where}")
             break
         if self.drop is None:
@@ -901,6 +1029,7 @@ class GraphView(QGraphicsView):
                 self.close_sequence_window_id = None
                 self.close_sequence_timer.invalidate()
             self.close_candidate = None
+            self.close_target_id = None
             self.close_press_point = None
             self.close_is_touch = False
             self.close_cancelled = False
@@ -940,6 +1069,7 @@ class GraphView(QGraphicsView):
             return
         if event.button() == Qt.MouseButton.LeftButton and self.close_candidate is not None:
             candidate = self.close_candidate
+            target_id = self.close_target_id
             force = self.close_force_candidate
             threshold = (TOUCH_DRAG_THRESHOLD if self.close_is_touch
                          else MOUSE_DRAG_THRESHOLD)
@@ -954,11 +1084,11 @@ class GraphView(QGraphicsView):
                 if force:
                     self.close_sequence_window_id = None
                     self.close_sequence_timer.invalidate()
-                    self.force_close_requested.emit(candidate.window["id"])
+                    self.force_close_requested.emit(target_id)
                 else:
-                    self.close_sequence_window_id = candidate.window["id"]
+                    self.close_sequence_window_id = target_id
                     self.close_sequence_timer.start()
-                    self.close_requested.emit(candidate.window["id"])
+                    self.close_requested.emit(target_id)
             elif force:
                 self.close_sequence_window_id = None
                 self.close_sequence_timer.invalidate()
@@ -973,6 +1103,7 @@ class GraphView(QGraphicsView):
         if self.pressed:
             clicked_node = self.pressed
             wid = self.pressed.window["id"]
+            clicked_id = self.member_id_at(clicked_node, event.position().toPoint())
             dragging, drop = self.dragging, self.drop
             self.cancel_drag()
             if self.connected and not self.busy:
@@ -980,7 +1111,7 @@ class GraphView(QGraphicsView):
                     self.move_requested.emit(wid, *drop)
                 elif not dragging:
                     clicked_node.animate_click()
-                    self.focus_requested.emit(wid)
+                    self.focus_requested.emit(clicked_id)
             self.interaction_finished.emit()
             return
         super().mouseReleaseEvent(event)

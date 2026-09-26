@@ -236,6 +236,23 @@ class OverlayTests(unittest.TestCase):
         self.assertEqual(overlay.phase, "hidden")
         self.assertFalse(overlay.isVisible())
 
+    def test_stack_members_have_separate_hints_and_lower_member_focuses(self):
+        controller, overlay, jobs = self.make_window()
+        controller.backend.data["windows"][1]["layout"]["pos_in_scrolling_layout"] = [1, 2]
+        controller.receive_state(controller.backend.data)
+        self.assertEqual([controller.hint_assignments.by_window[wid] for wid in (1, 2)],
+                         [1, 2])
+        overlay.toggle()
+        self.assertIs(overlay.view.nodes[1], overlay.view.nodes[2])
+        self.assertEqual(overlay.view.nodes[1].hints, {1: "1", 2: "2"})
+        QTest.keyClicks(overlay.view, "2")
+        self.assertEqual(overlay.phase, "closing")
+        finish, callback = jobs.pop(0)
+        finish()
+        self.assertTrue(controller.backend.data["windows"][1]["is_focused"])
+        callback(True, None)
+        self.assertEqual(overlay.phase, "hidden")
+
     def test_keyboard_selection_works_at_every_opacity(self):
         for opacity in (1.0, 0.8, 0.0):
             for count, hint in ((3, "2"), (12, "10")):

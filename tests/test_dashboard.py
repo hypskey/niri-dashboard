@@ -5,11 +5,13 @@ from dataclasses import replace
 from unittest.mock import patch
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from PySide6.QtCore import QPoint, QPointF, QRectF, Qt
-from PySide6.QtGui import QTransform
+from PySide6.QtGui import QColor, QImage, QPainter, QTransform
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QGraphicsEllipseItem, QGraphicsLineItem
 from niridashboard import niri
 from niridashboard.backend import Backend, demo_state
+from niridashboard.dashboard_nodes import dashboard_nodes
+from niridashboard.controller import DashboardController
 from niridashboard.main import Dashboard
 
 
@@ -45,6 +47,18 @@ class ModelNiri:
             col = max([niri.position(p)[0] for p in self.windows if p["workspace_id"] == target and niri.position(p)] or [0]) + 1
             w["workspace_id"] = target
             w["layout"]["pos_in_scrolling_layout"] = [col, 1]
+            self.normalize(old)
+        elif name == "MoveColumnToWorkspace":
+            focused = next(w for w in self.windows if w["is_focused"])
+            old = focused["workspace_id"]
+            source = niri.position(focused)[0]
+            target = args["reference"]["Id"]
+            column = max([niri.position(w)[0] for w in self.windows
+                          if w["workspace_id"] == target and niri.position(w)] or [0]) + 1
+            for member in self.windows:
+                if member["workspace_id"] == old and niri.position(member) and niri.position(member)[0] == source:
+                    member["workspace_id"] = target
+                    member["layout"]["pos_in_scrolling_layout"][0] = column
             self.normalize(old)
         elif name == "MoveWindowToTiling":
             w = next(w for w in self.windows if w["id"] == args["id"])
@@ -99,11 +113,33 @@ class MoveTests(unittest.TestCase):
         self.move(model, 2, 1)
         self.assertEqual(self.ids(model, 1), [2])
 
-    def test_extract_only_dragged_window_from_stack(self):
+    def test_two_window_column_moves_together_and_preserves_order(self):
         model = ModelNiri([window(1, col=1), window(2, col=1, row=2), window(3, col=2, focused=True)])
-        self.move(model, 2, 1, 1)
-        self.assertEqual(self.ids(model), [2, 1, 3])
-        self.assertEqual(niri.position(model.windows[0])[0], 2)
+        self.move(model, 2, 2)
+        self.assertEqual(self.ids(model, 2), [1, 2])
+        self.assertEqual([niri.position(w) for w in model.windows[:2]], [[1, 1], [1, 2]])
+        self.assertEqual(self.ids(model, 1), [3])
+        self.assertEqual(next(w["id"] for w in model.windows if w["is_focused"]), 3)
+        self.assertEqual([name for name, _args in model.calls if name == "MoveColumnToWorkspace"],
+                         ["MoveColumnToWorkspace"])
+
+    def test_two_window_column_reorders_as_one_unit(self):
+        model = ModelNiri([window(1, col=1), window(2, col=1, row=2),
+                           window(3, col=2, focused=True), window(4, col=3)])
+        self.move(model, 2, 1, 4)
+        self.assertEqual(self.ids(model), [3, 1, 2, 4])
+        self.assertEqual([niri.position(w) for w in model.windows[:2]], [[2, 1], [2, 2]])
+        self.assertEqual(next(w["id"] for w in model.windows if w["is_focused"]), 3)
+
+    def test_larger_column_is_left_for_later_ui_design(self):
+        windows = [window(1, col=1), window(2, col=1, row=2), window(3, col=1, row=3)]
+        self.assertEqual([len(node.members) for node in dashboard_nodes(windows)], [1, 1, 1])
+
+    def test_two_window_column_has_a_numeric_hint_for_each_member(self):
+        data = demo_state()
+        data["windows"][1]["layout"]["pos_in_scrolling_layout"] = [1, 2]
+        order = DashboardController._hint_order(data)
+        self.assertEqual(order[:3], [1, 2, 3])
 
     def test_floating_becomes_tiled(self):
         model = ModelNiri([window(1, floating=True), window(2, focused=True)])
@@ -400,6 +436,96 @@ class GraphTests(unittest.TestCase):
         target = self.view.nodes[2]
         self.drag(3, self.view.mapFromScene(target.pos() + QPointF(5, 50)))
         self.assertEqual(self.moves, [(3, 1, 1)])
+
+    def test_two_window_stack_is_one_node_with_half_clicks_and_whole_stack_drag(self):
+        data = demo_state()
+        data["windows"][1]["layout"]["pos_in_scrolling_layout"] = [1, 2]
+        for member in data["windows"]:
+            member["is_focused"] = member["id"] == 2
+        self.dashboard.receive_state(data)
+        stack = self.view.nodes[1]
+        self.assertIs(stack, self.view.nodes[2])
+        self.assertEqual([member["id"] for member in stack.dashboard_node.members], [1, 2])
+        row = next(row for row in self.view.rows if row["workspace"]["id"] == 1)
+        self.assertEqual(len(row["windows"]), 2)
+        self.assertEqual(self.view.focus_path.endpoint.x(),
+                         row["start"] + stack.icon_circle_rect(stack.settings).left())
+        circle = stack.icon_circle_rect(stack.settings)
+        for x_fraction, y_fraction, expected in ((0.70, 0.25, 1),
+                                                 (0.30, 0.75, 2)):
+            point = self.view.mapFromScene(
+                stack.pos() + QPointF(circle.left() + circle.width() * x_fraction,
+                                       circle.top() + circle.height() * y_fraction))
+            QTest.mouseClick(self.view.viewport(), Qt.MouseButton.LeftButton, pos=point)
+            self.assertEqual(self.focuses[-1], expected)
+        row = next(row for row in self.view.rows if row["workspace"]["id"] == 8)
+        self.drag(2, self.view.mapFromScene(QPointF(row["start"] + 50, row["y"] + 50)))
+        self.assertEqual(self.moves, [(1, 8, None)])
+
+    def test_stack_uses_full_size_icons_and_focus_dot_beside_member_name(self):
+        data = demo_state()
+        data["windows"][1]["layout"]["pos_in_scrolling_layout"] = [1, 2]
+        dot_color = QColor(self.view.colors.focused_route)
+        for focused_id, focused_index in ((1, 0), (2, 1)):
+            for member in data["windows"]:
+                member["is_focused"] = member["id"] == focused_id
+            self.dashboard.receive_state(data)
+            stack = self.view.nodes[1]
+            image = QImage(stack.width, stack.height, QImage.Format.Format_ARGB32_Premultiplied)
+            image.fill(Qt.GlobalColor.transparent)
+            painter = QPainter(image)
+            with patch.object(stack.icons, "rendered", wraps=stack.icons.rendered) as rendered:
+                stack.paint(painter, None)
+            painter.end()
+            circle = stack.icon_circle_rect(stack.settings)
+            self.assertEqual([call.args[1] for call in rendered.call_args_list],
+                             [stack.settings.scaled(stack.settings.icon_size)] * 2)
+            for index in (0, 1):
+                y = round(circle.bottom() + stack.settings.scaled(4 + 18 * index + 9))
+                has_dot = any(image.pixelColor(x, y) == dot_color
+                              for x in range(stack.settings.scaled(5), stack.width // 2))
+                self.assertEqual(has_dot, index == focused_index)
+
+    def test_stack_halves_keep_per_window_picker_and_close_actions(self):
+        data = demo_state()
+        data["windows"][1]["layout"]["pos_in_scrolling_layout"] = [1, 2]
+        self.dashboard.controller.receive_state(data)
+        stack = self.view.nodes[1]
+        self.assertIs(stack, self.view.nodes[2])
+        self.assertEqual(stack.hints, {1: "1", 2: "2"})
+        circle = stack.icon_circle_rect(stack.settings)
+        upper = self.view.mapFromScene(
+            stack.pos() + QPointF(circle.left() + circle.width() * 0.70,
+                                   circle.top() + circle.height() * 0.25))
+        lower = self.view.mapFromScene(
+            stack.pos() + QPointF(circle.left() + circle.width() * 0.30,
+                                   circle.top() + circle.height() * 0.75))
+        QTest.mouseClick(self.view.viewport(), Qt.MouseButton.MiddleButton, pos=upper)
+        self.assertIsNotNone(self.dashboard.icon_picker)
+        self.dashboard.icon_picker.choose("whatsapp")
+        self.assertEqual(self.dashboard.controller.icon_overrides.get(1), "whatsapp")
+        self.assertIsNone(self.dashboard.controller.icon_overrides.get(2))
+        QTest.mouseClick(self.view.viewport(), Qt.MouseButton.MiddleButton, pos=lower)
+        self.assertIsNotNone(self.dashboard.icon_picker)
+        self.dashboard.icon_picker.choose("github")
+        self.assertEqual(self.dashboard.controller.icon_overrides.get(1), "whatsapp")
+        self.assertEqual(self.dashboard.controller.icon_overrides.get(2), "github")
+        stack = self.view.nodes[1]
+        self.assertEqual([member.get("icon_override") for member in stack.dashboard_node.members],
+                         ["whatsapp", "github"])
+        self.assertEqual([member["id"] for member in stack.dashboard_node.members], [1, 2])
+        self.assertEqual(self.view.hint_targets["2"], 2)
+        QTest.mouseClick(self.view.viewport(), Qt.MouseButton.MiddleButton, pos=lower)
+        self.dashboard.icon_picker.reset_requested.emit()
+        self.assertEqual(self.dashboard.controller.icon_overrides.get(1), "whatsapp")
+        self.assertIsNone(self.dashboard.controller.icon_overrides.get(2))
+        self.assertEqual([member.get("icon_override") for member in self.view.nodes[1].dashboard_node.members],
+                         ["whatsapp", None])
+        closes = []
+        self.view.close_requested.disconnect()
+        self.view.close_requested.connect(closes.append)
+        QTest.mouseClick(self.view.viewport(), Qt.MouseButton.RightButton, pos=lower)
+        self.assertEqual(closes, [2])
 
     def test_floating_target_inserts_at_tiled_end(self):
         data = demo_state()
@@ -718,6 +844,14 @@ class GraphTests(unittest.TestCase):
         finally:
             backend.stop()
             self.assertTrue(backend.wait(3000))
+
+    def test_demo_move_keeps_two_window_stack_together(self):
+        backend = Backend(demo=True)
+        backend.data["windows"][1]["layout"]["pos_in_scrolling_layout"] = [1, 2]
+        backend.demo_action("move", [2, 8, None])
+        moved = [w for w in backend.data["windows"] if w["id"] in (1, 2)]
+        self.assertEqual([w["workspace_id"] for w in moved], [8, 8])
+        self.assertEqual([niri.position(w) for w in moved], [[1, 1], [1, 2]])
 
     def test_worker_recovers_after_connection_failure(self):
         backend = Backend()

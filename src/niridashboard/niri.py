@@ -113,7 +113,7 @@ def move_window_to_workspace(window_id, workspace_id):
 
 
 def insert_window(window_id, workspace_id, before_id=None):
-    """Place a single window in its own column, before an anchor or at the end.
+    """Place a window or two-window Niri column before an anchor or at the end.
 
     Re-read after each structural change: Niri's column indices are transient.
     A failed sequence is not atomic; the worker always refreshes actual state.
@@ -122,6 +122,13 @@ def insert_window(window_id, workspace_id, before_id=None):
     window = next((w for w in windows if w["id"] == window_id), None)
     if window is None:
         raise RuntimeError("That window has closed.")
+    place = position(window)
+    if place and not window.get("is_floating"):
+        members = [w for w in windows if w.get("workspace_id") == window["workspace_id"]
+                   and not w.get("is_floating") and position(w)
+                   and position(w)[0] == place[0]]
+        if len(members) == 2:
+            return insert_column(members, workspace_id, before_id, windows)
     if not any(w["id"] == workspace_id for w in get_workspaces()):
         raise RuntimeError("That workspace no longer exists.")
     if before_id == window_id:
@@ -166,6 +173,60 @@ def insert_window(window_id, workspace_id, before_id=None):
         if previous is not None:
             remaining = get_windows()
             if any(w["id"] == previous for w in remaining):
+                focus_window(previous)
+
+
+def insert_column(members, workspace_id, before_id, windows):
+    """Move Niri's focused column intact, preserving its member order."""
+    if not any(workspace["id"] == workspace_id for workspace in get_workspaces()):
+        raise RuntimeError("That workspace no longer exists.")
+    members = ordered(members)
+    member_ids = {member["id"] for member in members}
+    top_id = members[0]["id"]
+    if before_id in member_ids:
+        return
+    if before_id is not None and not any(
+            window["id"] == before_id and window["workspace_id"] == workspace_id
+            for window in windows):
+        raise RuntimeError("The destination changed. Please try again.")
+    previous = next((window["id"] for window in windows if window.get("is_focused")), None)
+    try:
+        focus_window(top_id)
+        focused = next((window for window in get_windows() if window.get("is_focused")), None)
+        if focused is None or focused["id"] != top_id:
+            raise RuntimeError("Column focus changed; the move was cancelled.")
+        if members[0]["workspace_id"] != workspace_id:
+            action("MoveColumnToWorkspace", reference={"Id": workspace_id}, focus=False)
+        current_windows = get_windows()
+        moved = [window for window in current_windows if window["id"] in member_ids]
+        if (len(moved) != 2 or any(window["workspace_id"] != workspace_id or
+                                   not position(window) for window in moved) or
+                len({position(window)[0] for window in moved}) != 1 or
+                [window["id"] for window in ordered(moved)] !=
+                [window["id"] for window in members]):
+            raise RuntimeError("Niri changed the column during the move.")
+        source = position(moved[0])[0]
+        peers = [window for window in current_windows
+                 if window["workspace_id"] == workspace_id and position(window)]
+        if before_id is None:
+            target = max(position(window)[0] for window in peers)
+        else:
+            anchor = next((window for window in peers if window["id"] == before_id), None)
+            if anchor is None:
+                raise RuntimeError("The destination changed during the move.")
+            target = position(anchor)[0]
+            if source < target:
+                target -= 1
+        if source != target:
+            focus_window(top_id)
+            focused = next((window for window in get_windows() if window.get("is_focused")), None)
+            if focused is None or focused["id"] != top_id:
+                raise RuntimeError("Column focus changed; ordering was cancelled.")
+            action("MoveColumnToIndex", index=max(1, target))
+    finally:
+        if previous is not None:
+            remaining = get_windows()
+            if any(window["id"] == previous for window in remaining):
                 focus_window(previous)
 
 
